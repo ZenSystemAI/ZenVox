@@ -109,7 +109,7 @@ class WhisperTray:
         self.model_name   = saved.get("model_name",   "large-v3-turbo")
         self.lang_name    = saved.get("lang_name",    "Auto-detect")
         self.mic_name     = saved.get("mic_name",     self.input_devs[0][1] if self.input_devs else "default")
-        self.clean_model  = saved.get("clean_model",  "qwen3:14b")
+        self.clean_model  = saved.get("clean_model",  "llama3.2:3b")
 
         ctk.set_appearance_mode("dark")
         self.root = ctk.CTk()
@@ -447,24 +447,34 @@ class WhisperTray:
         "Output ONLY the corrected text — no explanation, no quotes, no preamble."
     )
 
-    def _ollama_clean(self, text: str) -> str:
+    def _ollama_clean(self, text: str, timeout: int = 8) -> str:
+        import concurrent.futures
         try:
             import ollama
-            print(f"[Ollama/clean] model={self.clean_model}, input={text[:80]!r}")
-            resp = ollama.chat(
-                model=self.clean_model,
-                messages=[
-                    {"role": "system", "content": self._SYSTEM_CLEAN},
-                    {"role": "user",   "content": text},
-                ],
-                options={"temperature": 0.2},
-            )
-            result = resp["message"]["content"].strip()
+
+            def _call():
+                print(f"[Ollama/clean] model={self.clean_model}, input={text[:80]!r}")
+                resp = ollama.chat(
+                    model=self.clean_model,
+                    messages=[
+                        {"role": "system", "content": self._SYSTEM_CLEAN},
+                        {"role": "user",   "content": text},
+                    ],
+                    options={"temperature": 0.2},
+                )
+                return resp["message"]["content"].strip()
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(_call)
+                result = future.result(timeout=timeout)
             print(f"[Ollama/clean] output={result[:80]!r}")
             return result
+        except concurrent.futures.TimeoutError:
+            print(f"[Ollama/clean] TIMEOUT after {timeout}s — using raw")
+            return text
         except Exception as e:
             print(f"[Ollama/clean] ERROR: {e}")
-            return text  # fall back to raw if Ollama fails
+            return text
 
 
 if __name__ == "__main__":
