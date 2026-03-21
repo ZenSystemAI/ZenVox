@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./python.exe:*)",
+      "Bash(\"C:/Users/steve/AppData/Local/Programs/Python/Python314/python.exe\":*)",
+      "Bash(timeout 8 C:/Users/steve/AppData/Local/Programs/Python/Python314/python.exe:*)",
+      "Bash(\"C:/Users/steve/AppData/Local/Programs/Python/Python314/pythonw.exe\":*)",
+      "Read(//e/dev/ai-tools/**)",
+      "Read(//c/Users/steve/AppData/Local/WhisperApp/**)",
+      "Bash(powershell -c \"\n\\\\$shell = New-Object -COM WScript.Shell\n\\\\$pythonw = 'C:\\\\\\\\Users\\\\\\\\steve\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Programs\\\\\\\\Python\\\\\\\\Python314\\\\\\\\pythonw.exe'\n\\\\$target = 'E:\\\\\\\\AI Tools\\\\\\\\whisper\\\\\\\\whisper.py'\n\\\\$workdir = 'E:\\\\\\\\AI Tools\\\\\\\\whisper'\n\\\\$icon = 'E:\\\\\\\\AI Tools\\\\\\\\whisper\\\\\\\\whisper.ico'\n\n\\\\$shortcuts = @\\(\n    'C:\\\\\\\\Users\\\\\\\\steve\\\\\\\\AppData\\\\\\\\Roaming\\\\\\\\Microsoft\\\\\\\\Windows\\\\\\\\Start Menu\\\\\\\\Programs\\\\\\\\Startup\\\\\\\\Whisper.lnk',\n    'C:\\\\\\\\Users\\\\\\\\steve\\\\\\\\AppData\\\\\\\\Roaming\\\\\\\\Microsoft\\\\\\\\Windows\\\\\\\\Start Menu\\\\\\\\Programs\\\\\\\\Whisper.lnk',\n    'E:\\\\\\\\AI Tools\\\\\\\\whisper\\\\\\\\Whisper.lnk'\n\\)\n\nforeach \\(\\\\$path in \\\\$shortcuts\\) {\n    \\\\$lnk = \\\\$shell.CreateShortcut\\(\\\\$path\\)\n    \\\\$lnk.TargetPath = \\\\$pythonw\n    \\\\$lnk.Arguments = \\\\\"\\\\`\\\\\"\\\\$target\\\\`\\\\\"\\\\\"\n    \\\\$lnk.WorkingDirectory = \\\\$workdir\n    \\\\$lnk.IconLocation = \\\\$icon\n    \\\\$lnk.Save\\(\\)\n    Write-Host \\\\\"Updated: \\\\$path\\\\\"\n}\")",
+      "Bash(rm -rf \"C:/Users/steve/AppData/Local/WhisperApp/\"\necho \"Done: $?\")",
+      "mcp__shared-brain__brain_store",
+      "mcp__firecrawl-mcp__firecrawl_search",
+      "mcp__firecrawl-mcp__firecrawl_scrape",
+      "WebFetch(domain:deepgram.com)",
+      "WebFetch(domain:www.gladia.io)",
+      "WebFetch(domain:artificialanalysis.ai)",
+      "WebFetch(domain:groq.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:superwhisper.com)",
+      "WebFetch(domain:wisprflow.ai)",
+      "WebFetch(domain:medium.com)",
+      "Bash(pip show:*)",
+      "Bash(pip list:*)",
+      "Bash(python:*)",
+      "Bash(git:*)",
+      "Bash(powershell -NoProfile -Command \"\n\\\\$ws = New-Object -ComObject WScript.Shell\n\\\\$lnk = \\\\$ws.CreateShortcut\\('C:\\\\\\\\Users\\\\\\\\steve\\\\\\\\AppData\\\\\\\\Roaming\\\\\\\\Microsoft\\\\\\\\Windows\\\\\\\\Start Menu\\\\\\\\Programs\\\\\\\\Whisper.lnk'\\)\nWrite-Host 'Target:' \\\\$lnk.TargetPath\nWrite-Host 'Args:' \\\\$lnk.Arguments\nWrite-Host 'WorkDir:' \\\\$lnk.WorkingDirectory\n\" 2>&1)",
+      "Bash(where:*)",
+      "mcp__shared-brain__brain_briefing"
+    ]
+  }
+}
