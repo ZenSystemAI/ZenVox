@@ -12,27 +12,40 @@ import glob
 
 block_cipher = None
 
-# ── Paths ────────────────────────────────────────────────────────────────────
-sp = site.getsitepackages()[0]
+# ── Paths — resolve via actual package imports, not site.getsitepackages() ──
+# site.getsitepackages()[0] returns Python root, not Lib/site-packages
+import importlib
+def _pkg_dir(name):
+    """Get the directory of an installed package."""
+    spec = importlib.util.find_spec(name)
+    if spec and spec.origin:
+        return os.path.dirname(spec.origin)
+    return None
 
-# ── Collect NVIDIA CUDA DLLs ────────────────────────────────────────────────
+# ── Collect NVIDIA CUDA DLLs (cublas + cudnn) ──────────────────────────────
 nvidia_bins = []
-nvidia_dir = os.path.join(sp, 'nvidia')
-if os.path.isdir(nvidia_dir):
-    for pkg in os.listdir(nvidia_dir):
-        bin_dir = os.path.join(nvidia_dir, pkg, 'bin')
-        if os.path.isdir(bin_dir):
-            for dll in os.listdir(bin_dir):
-                if dll.endswith('.dll'):
-                    nvidia_bins.append((os.path.join(bin_dir, dll), '.'))
+# Find nvidia packages by walking site-packages directories
+for _sp in site.getsitepackages():
+    for _sub in [_sp, os.path.join(_sp, 'Lib', 'site-packages')]:
+        nvidia_dir = os.path.join(_sub, 'nvidia')
+        if os.path.isdir(nvidia_dir):
+            for pkg in os.listdir(nvidia_dir):
+                bin_dir = os.path.join(nvidia_dir, pkg, 'bin')
+                if os.path.isdir(bin_dir):
+                    for dll in os.listdir(bin_dir):
+                        if dll.endswith('.dll'):
+                            full_path = os.path.join(bin_dir, dll)
+                            nvidia_bins.append((full_path, '.'))
+                            print(f"  CUDA DLL: {dll} ({os.path.getsize(full_path) // 1024 // 1024}MB)")
 
 # ── Collect ctranslate2 DLLs ────────────────────────────────────────────────
-ct2_dir = os.path.join(sp, 'ctranslate2')
+ct2_dir = _pkg_dir('ctranslate2')
 ct2_bins = []
-if os.path.isdir(ct2_dir):
+if ct2_dir:
     for f in os.listdir(ct2_dir):
         if f.endswith('.dll'):
             ct2_bins.append((os.path.join(ct2_dir, f), '.'))
+            print(f"  CT2 DLL: {f}")
 
 # ── Collect Silero VAD model ────────────────────────────────────────────────
 import faster_whisper
@@ -60,14 +73,16 @@ if ctk_dir is None:
     ctk_dir = os.path.dirname(customtkinter.__file__)
 
 # ── Collect onnxruntime DLLs ────────────────────────────────────────────────
-ort_dir = os.path.join(sp, 'onnxruntime')
+ort_pkg_dir = _pkg_dir('onnxruntime')
 ort_bins = []
-if os.path.isdir(ort_dir):
-    for root, dirs, files in os.walk(ort_dir):
+if ort_pkg_dir:
+    ort_root = os.path.dirname(ort_pkg_dir)  # go up from onnxruntime/ to site-packages/
+    for root, dirs, files in os.walk(ort_pkg_dir):
         for f in files:
-            if f.endswith(('.dll', '.so')):
-                rel = os.path.relpath(root, sp)
+            if f.endswith(('.dll', '.so', '.pyd')):
+                rel = os.path.relpath(root, ort_root)
                 ort_bins.append((os.path.join(root, f), rel))
+                print(f"  ORT: {f} -> {rel}")
 
 a = Analysis(
     ['whisper.py'],

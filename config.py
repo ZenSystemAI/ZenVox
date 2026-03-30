@@ -15,7 +15,11 @@ import sounddevice as sd
 from PIL import Image, ImageDraw
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-APP_DIR = Path(__file__).parent
+# In bundled app, __file__ is inside _internal/ — settings should be next to the .exe
+if getattr(sys, 'frozen', False):
+    APP_DIR = Path(sys.executable).parent
+else:
+    APP_DIR = Path(__file__).parent
 SETTINGS_FILE = APP_DIR / "settings.json"
 LOG_FILE = APP_DIR / "whisper.log"
 DB_FILE = APP_DIR / "history.db"
@@ -115,25 +119,47 @@ def _detect_gpu_name():
     return "CUDA GPU"
 
 try:
-    import site
     import ctypes as _ct
     import ctranslate2
-    for sp in site.getsitepackages():
-        nvidia_dir = os.path.join(sp, "nvidia")
-        if not os.path.isdir(nvidia_dir):
-            continue
-        for pkg in os.listdir(nvidia_dir):
-            bin_dir = os.path.join(nvidia_dir, pkg, "bin")
-            if not os.path.isdir(bin_dir):
+
+    # Search for CUDA DLLs in multiple locations:
+    # 1. PyInstaller _internal dir (bundled app)
+    # 2. nvidia pip packages (dev/pip install)
+    _dll_dirs = []
+
+    # Bundled app: DLLs are next to the exe in _internal/
+    if getattr(sys, 'frozen', False):
+        _internal = os.path.join(sys._MEIPASS)
+        if os.path.isdir(_internal):
+            _dll_dirs.append(_internal)
+
+    # Dev mode: nvidia pip packages
+    try:
+        import site as _site
+        for sp in _site.getsitepackages():
+            nvidia_dir = os.path.join(sp, "nvidia")
+            if not os.path.isdir(nvidia_dir):
                 continue
+            for pkg in os.listdir(nvidia_dir):
+                bin_dir = os.path.join(nvidia_dir, pkg, "bin")
+                if os.path.isdir(bin_dir):
+                    _dll_dirs.append(bin_dir)
+    except Exception:
+        pass
+
+    for bin_dir in _dll_dirs:
+        try:
             os.add_dll_directory(bin_dir)
-            os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
-            for dll in os.listdir(bin_dir):
-                if dll.endswith(".dll"):
-                    try:
-                        _ct.CDLL(os.path.join(bin_dir, dll))
-                    except Exception:
-                        pass
+        except OSError:
+            pass
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+        for dll in os.listdir(bin_dir):
+            if dll.endswith(".dll"):
+                try:
+                    _ct.CDLL(os.path.join(bin_dir, dll))
+                except Exception:
+                    pass
+
     if ctranslate2.get_cuda_device_count() > 0:
         DEVICE = "cuda"
         COMPUTE = "float16"
