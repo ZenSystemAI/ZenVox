@@ -1,5 +1,5 @@
 """
-history.py — SQLite transcription history for ZenScribe
+history.py — SQLite transcription history for ZenVox
 """
 import sqlite3
 import threading

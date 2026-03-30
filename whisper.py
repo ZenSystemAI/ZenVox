@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-whisper.py  —  ZenScribe: Voice to text, cleaned by AI.
+whisper.py  —  ZenVox: Voice to text, cleaned by AI.
 Ctrl+Alt+F12 = record (auto-stops on silence)
 Ctrl+Alt+F11 = re-paste last transcription
 """
@@ -379,7 +379,7 @@ class FloatingOverlay:
 # APP — GUI + Tray + Hotkey + Orchestration
 # ═══════════════════════════════════════════════════════════════════════════════
 class WhisperApp:
-    # ZenScribe palette
+    # ZenVox palette
     BG     = "#0F0F0F"
     PANEL  = "#191919"
     TEXT   = "#e4e4e7"
@@ -403,7 +403,7 @@ class WhisperApp:
 
         ctk.set_appearance_mode("dark")
         self.root = ctk.CTk()
-        self.root.title("ZenScribe \u2014 Voice to Text")
+        self.root.title("ZenVox \u2014 Voice to Text")
         self.root.geometry("720x700")
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
@@ -423,8 +423,8 @@ class WhisperApp:
         else:
             self.root.withdraw()
 
-        self.icon = pystray.Icon("zenscribe", ICONS["loading"],
-                                 "ZenScribe \u2014 Loading...", menu=self._build_menu())
+        self.icon = pystray.Icon("zenvox", ICONS["loading"],
+                                 "ZenVox \u2014 Loading...", menu=self._build_menu())
 
         threading.Thread(target=self._load_model, daemon=True).start()
         threading.Thread(target=self._hotkey_listener, daemon=True).start()
@@ -449,7 +449,7 @@ class WhisperApp:
         si.pack(fill="x", padx=16, pady=12)
         ctk.CTkLabel(si, text="Zen", font=("Inter Tight", 16, "bold"),
                      text_color=T).pack(side="left")
-        ctk.CTkLabel(si, text="Scribe", font=("Inter Tight", 16, "bold"),
+        ctk.CTkLabel(si, text="Vox", font=("Inter Tight", 16, "bold"),
                      text_color=TL).pack(side="left")
         ctk.CTkLabel(si, text="  Voice to Text", font=("Inter Tight", 14),
                      text_color=M).pack(side="left")
@@ -749,9 +749,9 @@ class WhisperApp:
 
     # ── Status ────────────────────────────────────────────────────────────
     def _set_status(self, state, tooltip=None):
-        msg = tooltip or f"ZenScribe \u2014 {state}"
+        msg = tooltip or f"ZenVox \u2014 {state}"
         self.icon.icon = ICONS.get(state, ICONS["idle"])
-        self.icon.title = f"ZenScribe \u2014 {msg}"
+        self.icon.title = f"ZenVox \u2014 {msg}"
         self.root.after(0, lambda: self.gui_status.set(msg))
 
     # ── Recording bar ─────────────────────────────────────────────────────

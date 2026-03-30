@@ -1,5 +1,5 @@
 """
-config.py — Settings, constants, logging, GPU detection for ZenScribe
+config.py — Settings, constants, logging, GPU detection for ZenVox
 """
 import json
 import logging
@@ -274,7 +274,7 @@ class Settings:
                 ("gemini", "gemini_api_key"), ("openai", "openai_api_key"),
                 ("anthropic", "anthropic_api_key"), ("groq", "groq_api_key"),
             ]:
-                val = keyring.get_password("zenscribe", provider)
+                val = keyring.get_password("zenvox", provider)
                 if val and not getattr(settings, attr):
                     setattr(settings, attr, val)
         except Exception:
@@ -293,7 +293,7 @@ class Settings:
             ]:
                 val = data.get(attr, "")
                 if val:
-                    keyring.set_password("zenscribe", provider, val)
+                    keyring.set_password("zenvox", provider, val)
                     data[attr] = ""  # Don't write to disk
             saved_to_keyring = True
         except Exception:

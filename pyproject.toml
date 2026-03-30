@@ -1,5 +1,5 @@
 [project]
-name = "zenscribe"
+name = "zenvox"
 version = "1.0.0"
 description = "Voice to text, cleaned by AI. Fast, private, always ready."
 requires-python = ">=3.11"
@@ -37,7 +37,7 @@ all = [
 gpu = ["ctranslate2>=4.5"]
 
 [project.scripts]
-zenscribe = "whisper:main"
+zenvox = "whisper:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]

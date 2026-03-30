@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-install.py  —  One-time setup for ZenScribe.
+install.py  —  One-time setup for ZenVox.
 Converts the icon PNG to .ico and creates Start Menu + Startup shortcuts.
 
 Run once: python install.py
@@ -14,19 +14,19 @@ from PIL import Image
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 HERE        = Path(__file__).parent.resolve()
-ICON_PNG    = HERE / "icon_concepts" / "zenscribe_icon_final.png"
+ICON_PNG    = HERE / "icon_concepts" / "zenvox_icon_final.png"
 ICO_OUT     = HERE / "whisper.ico"
 SCRIPT      = HERE / "whisper.py"
 PYTHONW     = Path(sys.executable).parent / "pythonw.exe"
-START_MENU  = Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/ZenScribe.lnk"
+START_MENU  = Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/ZenVox.lnk"
 
 
 def build_ico():
     if not ICON_PNG.exists():
         print(f"Icon source not found: {ICON_PNG}")
-        print("Run the app first or place zenscribe_icon_final.png in icon_concepts/")
+        print("Run the app first or place zenvox_icon_final.png in icon_concepts/")
         return False
-    print("Building whisper.ico from ZenScribe icon...")
+    print("Building whisper.ico from ZenVox icon...")
     img = Image.open(ICON_PNG).convert("RGBA")
     sizes = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
     img.save(ICO_OUT, format="ICO", sizes=sizes)
@@ -42,7 +42,7 @@ $lnk.TargetPath       = "{target}"
 $lnk.Arguments        = '"{script}"'
 $lnk.WorkingDirectory = "{workdir}"
 $lnk.IconLocation     = "{icon},0"
-$lnk.Description      = "ZenScribe — Voice to text, cleaned by AI"
+$lnk.Description      = "ZenVox — Voice to text, cleaned by AI"
 $lnk.Save()
 Write-Host "Shortcut created: {lnk}"
 """
@@ -75,7 +75,7 @@ def create_shortcut():
         print(f"  -> {START_MENU}")
         print()
         print("To pin to Start Menu:")
-        print("  1. Press Win key and type 'ZenScribe'")
+        print("  1. Press Win key and type 'ZenVox'")
         print("  2. Right-click the app -> 'Pin to Start'")
 
 
@@ -84,4 +84,4 @@ if __name__ == "__main__":
     if build_ico():
         create_shortcut()
     print()
-    print("Done! Run 'ZenScribe' from the Start Menu (no terminal window).")
+    print("Done! Run 'ZenVox' from the Start Menu (no terminal window).")
