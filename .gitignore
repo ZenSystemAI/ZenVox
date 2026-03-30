@@ -2,5 +2,11 @@ __pycache__/
 settings.json
 *.lnk
 history.db
+history.db-shm
+history.db-wal
 whisper.log
 whisper.log.*
+*.ico
+dist/
+build/
+*.egg-info/

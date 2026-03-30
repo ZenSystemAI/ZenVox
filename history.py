@@ -1,5 +1,5 @@
 """
-history.py — SQLite transcription history for ZenSystem Whisper
+history.py — SQLite transcription history for ZenScribe
 """
 import sqlite3
 import threading

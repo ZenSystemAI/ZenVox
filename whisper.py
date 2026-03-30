@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-whisper.py  —  ZenSystem Whisper: Voice to text, best in class.
+whisper.py  —  ZenScribe: Voice to text, cleaned by AI.
 Ctrl+Alt+F12 = record (auto-stops on silence)
 Ctrl+Alt+F11 = re-paste last transcription
 """
@@ -28,11 +28,13 @@ import sounddevice as sd
 from datetime import datetime
 
 from config import (
-    Settings, SAMPLE_RATE, VAD_THRESHOLD, VAD_NEG_THRESH, CPU_THREADS, NUM_WORKERS,
+    Settings, SETTINGS_FILE,
+    SAMPLE_RATE, VAD_THRESHOLD, VAD_NEG_THRESH, CPU_THREADS, NUM_WORKERS,
     MODELS, LANGS, CLEANING_PRESETS, OUTPUT_MODES, ICONS,
     DEVICE, COMPUTE, DEVICE_LABEL, BEEP_START, BEEP_STOP,
     setup_logging, list_input_devices, APP_DIR,
 )
+from providers import PROVIDERS, PROVIDER_NAMES, create_provider
 from history import History
 
 log = setup_logging()
@@ -47,7 +49,7 @@ class WhisperEngine:
         self._lock = threading.Lock()
         self._whisper_model = None
         self._vad_model = None
-        self._gemini_model = None
+        self._cleaning_provider = None
         self._recording = False
         self._transcribing = False
         self._audio_chunks = []
@@ -90,7 +92,7 @@ class WhisperEngine:
             self.settings.model_name, device=DEVICE, compute_type=COMPUTE,
             cpu_threads=CPU_THREADS, num_workers=NUM_WORKERS)
         self._vad_model = get_vad_model()
-        self._get_gemini_model()
+        self._get_cleaning_provider()
         log.info(f"Loaded {self.settings.model_name} on {DEVICE_LABEL}")
         if on_status:
             on_status("idle", f"Ready [{DEVICE_LABEL}]")
@@ -196,31 +198,35 @@ class WhisperEngine:
         finally:
             self._transcribing = False
 
-    # ── Gemini cleaning ───────────────────────────────────────────────────
+    # ── AI cleaning ───────────────────────────────────────────────────────
     def clean_text(self, text):
         try:
-            model = self._get_gemini_model()
-            if model is None:
-                log.warning("No Gemini key — raw")
+            provider = self._get_cleaning_provider()
+            if provider is None:
+                log.warning("No cleaning provider configured — returning raw")
                 return text
 
             def _call():
-                log.info(f"Gemini [{self.settings.clean_model}]: {text[:80]!r}")
-                r = model.generate_content(
-                    f"[RAW] {text} [/RAW]",
-                    generation_config={"temperature": 0.2})
-                return r.text.strip()
+                log.info(f"Cleaning [{self.settings.clean_provider}/{self.settings.clean_model}]: {text[:120]!r}")
+                word_count = len(text.split())
+                max_tokens = max(1024, int(word_count * 2.5))
+                result = provider.clean(text, max_tokens=max_tokens)
+                # Sanity check: cleaned text should be at least 40% of raw length
+                if len(result) < len(text) * 0.4 and len(text) > 100:
+                    log.warning(f"Clean too short ({len(result)} vs {len(text)} raw chars) — using raw")
+                    return text
+                return result
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                result = ex.submit(_call).result(timeout=10)
-            log.info(f"Clean: {result[:80]!r}")
+                result = ex.submit(_call).result(timeout=15)
+            log.info(f"Clean: {result[:120]!r}")
             return result
         except concurrent.futures.TimeoutError:
-            log.warning("Gemini timeout")
+            log.warning("Cleaning API timeout — returning raw")
             return text
         except Exception as e:
-            log.error(f"Gemini: {e}")
-            self._gemini_model = None
+            log.error(f"Cleaning API: {e}")
+            self._cleaning_provider = None
             return text
 
     # ── VAD ────────────────────────────────────────────────────────────────
@@ -243,27 +249,26 @@ class WhisperEngine:
                         self._on_vad_stop()
                     return
 
-    # ── Gemini model cache ────────────────────────────────────────────────
-    def _get_gemini_model(self):
-        if self._gemini_model is None:
+    # ── Cleaning provider cache ──────────────────────────────────────────
+    def _get_cleaning_provider(self):
+        if self._cleaning_provider is None:
             try:
-                import google.generativeai as genai
-                key = self.settings.gemini_api_key.strip()
-                if not key:
+                provider_name = self.settings.clean_provider
+                api_key = self.settings.get_api_key().strip()
+                needs_key = PROVIDERS.get(provider_name, {}).get("needs_key", True)
+                if needs_key and not api_key:
                     return None
-                genai.configure(api_key=key)
                 preset = CLEANING_PRESETS.get(
                     self.settings.cleaning_preset, CLEANING_PRESETS["General"])
-                self._gemini_model = genai.GenerativeModel(
-                    model_name=self.settings.clean_model,
-                    system_instruction=preset)
+                self._cleaning_provider = create_provider(
+                    provider_name, api_key, self.settings.clean_model, preset)
             except Exception as e:
-                log.error(f"Gemini init: {e}")
+                log.error(f"Provider init [{self.settings.clean_provider}]: {e}")
                 return None
-        return self._gemini_model
+        return self._cleaning_provider
 
-    def invalidate_gemini(self):
-        self._gemini_model = None
+    def invalidate_provider(self):
+        self._cleaning_provider = None
 
     # ── Audio feedback ────────────────────────────────────────────────────
     def play_start_sound(self):
@@ -374,7 +379,7 @@ class FloatingOverlay:
 # APP — GUI + Tray + Hotkey + Orchestration
 # ═══════════════════════════════════════════════════════════════════════════════
 class WhisperApp:
-    # ZenSystem palette
+    # ZenScribe palette
     BG     = "#0F0F0F"
     PANEL  = "#191919"
     TEXT   = "#e4e4e7"
@@ -394,10 +399,11 @@ class WhisperApp:
         self.last_text = ""
         self._last_pasted = ""
         self._timer_job = None
+        self._is_first_run = not SETTINGS_FILE.exists()
 
         ctk.set_appearance_mode("dark")
         self.root = ctk.CTk()
-        self.root.title("Whisper \u2014 ZenSystem")
+        self.root.title("ZenScribe \u2014 Voice to Text")
         self.root.geometry("720x700")
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
@@ -408,10 +414,17 @@ class WhisperApp:
         self._build_gui()
         self._overlay = FloatingOverlay(self.root)
         self._refresh_history()
-        self.root.withdraw()
 
-        self.icon = pystray.Icon("whisper", ICONS["loading"],
-                                 "Whisper \u2014 Loading...", menu=self._build_menu())
+        if self._is_first_run:
+            # Show the settings window on first run so user can configure
+            self.root.deiconify()
+            self.root.lift()
+            self.settings.save()  # Create settings.json so next launch is normal
+        else:
+            self.root.withdraw()
+
+        self.icon = pystray.Icon("zenscribe", ICONS["loading"],
+                                 "ZenScribe \u2014 Loading...", menu=self._build_menu())
 
         threading.Thread(target=self._load_model, daemon=True).start()
         threading.Thread(target=self._hotkey_listener, daemon=True).start()
@@ -436,9 +449,9 @@ class WhisperApp:
         si.pack(fill="x", padx=16, pady=12)
         ctk.CTkLabel(si, text="Zen", font=("Inter Tight", 16, "bold"),
                      text_color=T).pack(side="left")
-        ctk.CTkLabel(si, text="System", font=("Inter Tight", 16, "bold"),
+        ctk.CTkLabel(si, text="Scribe", font=("Inter Tight", 16, "bold"),
                      text_color=TL).pack(side="left")
-        ctk.CTkLabel(si, text=" Whisper", font=("Inter Tight", 14),
+        ctk.CTkLabel(si, text="  Voice to Text", font=("Inter Tight", 14),
                      text_color=M).pack(side="left")
         ctk.CTkLabel(si, textvariable=self.gui_status, font=("Inter", 13),
                      text_color=TL).pack(side="right")
@@ -536,25 +549,29 @@ class WhisperApp:
             font=("Inter", 12), text_color=T,
             command=self._on_mic).pack(side="left", fill="x", expand=True)
 
-        # Row 2: API key + Gemini model
+        # Row 2: Provider + API key + Model
         r2 = ctk.CTkFrame(sp, fg_color="transparent")
         r2.pack(fill="x", padx=20, pady=(0, 6))
-        ctk.CTkLabel(r2, text="API key:", font=("Inter", 12),
-                     text_color=M).pack(side="left", padx=(0, 6))
-        self.gui_key = ctk.StringVar(value=self.settings.gemini_api_key)
-        ke = ctk.CTkEntry(r2, textvariable=self.gui_key, show="*",
-                          placeholder_text="AIza...", width=200,
+        self.gui_provider = ctk.StringVar(value=self.settings.clean_provider)
+        ctk.CTkComboBox(
+            r2, variable=self.gui_provider, values=PROVIDER_NAMES, width=105,
+            fg_color=B, border_color=BD, button_color=BD, button_hover_color=TL,
+            dropdown_fg_color=P, dropdown_hover_color=TL,
+            font=("Inter", 12), text_color=T,
+            command=self._on_provider).pack(side="left", padx=(0, 8))
+        self.gui_key = ctk.StringVar(value=self.settings.get_api_key())
+        self._key_entry = ctk.CTkEntry(r2, textvariable=self.gui_key, show="*",
+                          placeholder_text="API key...", width=200,
                           fg_color=B, border_color=BD, text_color=T, font=("Inter", 12))
-        ke.pack(side="left", padx=(0, 12))
-        ke.bind("<FocusOut>", lambda e: self._on_key())
-        ctk.CTkLabel(r2, text="Model:", font=("Inter", 12),
-                     text_color=M).pack(side="left", padx=(0, 6))
+        self._key_entry.pack(side="left", padx=(0, 8))
+        self._key_entry.bind("<FocusOut>", lambda e: self._on_key())
         self.gui_clean = ctk.StringVar(value=self.settings.clean_model)
         ce = ctk.CTkEntry(r2, textvariable=self.gui_clean,
-                          placeholder_text="gemini-2.5-flash-lite", width=180,
-                          fg_color=B, border_color=BD, text_color=T, font=("Inter", 12))
+                          placeholder_text=PROVIDERS.get(self.settings.clean_provider, {}).get("default_model", ""),
+                          width=180, fg_color=B, border_color=BD, text_color=T, font=("Inter", 12))
         ce.pack(side="left", fill="x", expand=True)
         ce.bind("<FocusOut>", lambda e: self._on_clean())
+        self._model_entry = ce
 
         # Row 3: Silence, Output, Cleaning preset
         r3 = ctk.CTkFrame(sp, fg_color="transparent")
@@ -596,7 +613,9 @@ class WhisperApp:
         # ─── Footer ───
         ff = ctk.CTkFrame(main, fg_color="transparent")
         ff.pack(fill="x", padx=32, pady=(0, 12))
-        ctk.CTkLabel(ff, text="ctrl+alt+f12 = record  \u00b7  ctrl+alt+f11 = re-paste",
+        hk_rec = self.settings.hotkey_record.lower()
+        hk_rep = self.settings.hotkey_repaste.lower()
+        ctk.CTkLabel(ff, text=f"{hk_rec} = record  \u00b7  {hk_rep} = re-paste",
                      font=("Inter", 11), text_color=M).pack(side="left")
 
     # ── GUI Callbacks ─────────────────────────────────────────────────────
@@ -665,14 +684,33 @@ class WhisperApp:
         self.settings.mic_name = self.gui_mic.get()
         self.settings.save()
 
+    def _on_provider(self, v=None):
+        new_provider = self.gui_provider.get()
+        self.settings.clean_provider = new_provider
+        # Switch to the provider's default model
+        default_model = PROVIDERS.get(new_provider, {}).get("default_model", "")
+        self.settings.clean_model = default_model
+        self.gui_clean.set(default_model)
+        self._model_entry.configure(placeholder_text=default_model)
+        # Load the stored key for this provider
+        self.gui_key.set(self.settings.get_api_key())
+        # Hide/show key field based on provider
+        needs_key = PROVIDERS.get(new_provider, {}).get("needs_key", True)
+        if needs_key:
+            self._key_entry.pack(side="left", padx=(0, 8), before=self._model_entry)
+        else:
+            self._key_entry.pack_forget()
+        self.engine.invalidate_provider()
+        self.settings.save()
+
     def _on_key(self):
-        self.settings.gemini_api_key = self.gui_key.get()
-        self.engine.invalidate_gemini()
+        self.settings.set_api_key(self.gui_key.get())
+        self.engine.invalidate_provider()
         self.settings.save()
 
     def _on_clean(self):
         self.settings.clean_model = self.gui_clean.get()
-        self.engine.invalidate_gemini()
+        self.engine.invalidate_provider()
         self.settings.save()
 
     def _on_silence(self):
@@ -702,7 +740,7 @@ class WhisperApp:
 
     def _on_preset(self, v=None):
         self.settings.cleaning_preset = self.gui_preset.get()
-        self.engine.invalidate_gemini()
+        self.engine.invalidate_provider()
         self.settings.save()
 
     def _on_audio(self):
@@ -711,9 +749,9 @@ class WhisperApp:
 
     # ── Status ────────────────────────────────────────────────────────────
     def _set_status(self, state, tooltip=None):
-        msg = tooltip or f"Whisper \u2014 {state}"
+        msg = tooltip or f"ZenScribe \u2014 {state}"
         self.icon.icon = ICONS.get(state, ICONS["idle"])
-        self.icon.title = f"Whisper \u2014 {msg}"
+        self.icon.title = f"ZenScribe \u2014 {msg}"
         self.root.after(0, lambda: self.gui_status.set(msg))
 
     # ── Recording bar ─────────────────────────────────────────────────────
@@ -806,20 +844,62 @@ class WhisperApp:
         self.engine.load_model(self._set_status)
 
     # ── Hotkey ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _parse_hotkey(hotkey_str):
+        """Parse 'Ctrl+Alt+F12' into (modifiers_bitmask, vk_code)."""
+        MOD_MAP = {"ctrl": 0x0002, "alt": 0x0001, "shift": 0x0004, "win": 0x0008}
+        VK_MAP = {
+            "f1": 0x70, "f2": 0x71, "f3": 0x72, "f4": 0x73,
+            "f5": 0x74, "f6": 0x75, "f7": 0x76, "f8": 0x77,
+            "f9": 0x78, "f10": 0x79, "f11": 0x7A, "f12": 0x7B,
+            "space": 0x20, "enter": 0x0D, "tab": 0x09,
+            "insert": 0x2D, "delete": 0x2E, "home": 0x24, "end": 0x23,
+            "pageup": 0x21, "pagedown": 0x22, "pause": 0x13,
+            "numpad0": 0x60, "numpad1": 0x61, "numpad2": 0x62,
+            "numpad3": 0x63, "numpad4": 0x64, "numpad5": 0x65,
+            "numpad6": 0x66, "numpad7": 0x67, "numpad8": 0x68,
+            "numpad9": 0x69,
+        }
+        parts = [p.strip().lower() for p in hotkey_str.split("+")]
+        mod = 0
+        vk = 0
+        for p in parts:
+            if p in MOD_MAP:
+                mod |= MOD_MAP[p]
+            elif p in VK_MAP:
+                vk = VK_MAP[p]
+            elif len(p) == 1 and p.isalnum():
+                vk = ord(p.upper())
+        return mod, vk
+
     def _hotkey_listener(self):
         import ctypes
         import ctypes.wintypes
-        MOD = 0x0002 | 0x0001  # CTRL + ALT
-        VK_F12, VK_F11 = 0x7B, 0x7A
         WM_HOTKEY = 0x0312
         ID_REC, ID_REP = 1, 2
         u32 = ctypes.windll.user32
-        if not u32.RegisterHotKey(None, ID_REC, MOD, VK_F12):
-            log.error("RegisterHotKey failed: Ctrl+Alt+F12")
+
+        rec_mod, rec_vk = self._parse_hotkey(self.settings.hotkey_record)
+        rep_mod, rep_vk = self._parse_hotkey(self.settings.hotkey_repaste)
+
+        # Retry hotkey registration (another instance may hold them briefly)
+        rec_ok = False
+        for attempt in range(5):
+            if u32.RegisterHotKey(None, ID_REC, rec_mod, rec_vk):
+                rec_ok = True
+                break
+            log.warning(f"RegisterHotKey {self.settings.hotkey_record} attempt {attempt + 1}/5 failed")
+            time.sleep(1.0)
+
+        if not rec_ok:
+            log.error(f"RegisterHotKey failed after 5 attempts: {self.settings.hotkey_record}")
+            self._set_status("idle", "Hotkey conflict — close other instance")
             return
-        if not u32.RegisterHotKey(None, ID_REP, MOD, VK_F11):
-            log.warning("RegisterHotKey failed: Ctrl+Alt+F11")
-        log.info("Hotkeys: F12=record, F11=re-paste")
+
+        if not u32.RegisterHotKey(None, ID_REP, rep_mod, rep_vk):
+            log.warning(f"RegisterHotKey failed: {self.settings.hotkey_repaste} (re-paste unavailable)")
+
+        log.info(f"Hotkeys: {self.settings.hotkey_record}=record, {self.settings.hotkey_repaste}=re-paste")
         msg = ctypes.wintypes.MSG()
         while u32.GetMessageW(ctypes.byref(msg), None, 0, 0):
             if msg.message == WM_HOTKEY:
@@ -941,5 +1021,9 @@ class WhisperApp:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
+def main():
     WhisperApp()
+
+
+if __name__ == "__main__":
+    main()

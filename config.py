@@ -1,5 +1,5 @@
 """
-config.py — Settings, constants, logging, GPU detection for ZenSystem Whisper
+config.py — Settings, constants, logging, GPU detection for ZenScribe
 """
 import json
 import logging
@@ -24,8 +24,8 @@ DB_FILE = APP_DIR / "history.db"
 SAMPLE_RATE = 16000
 VAD_THRESHOLD = 0.5
 VAD_NEG_THRESH = 0.35
-CPU_THREADS = 16
-NUM_WORKERS = 4
+CPU_THREADS = min(os.cpu_count() or 4, 16)
+NUM_WORKERS = min(os.cpu_count() // 4 or 1, 4)
 
 # ── Models ───────────────────────────────────────────────────────────────────
 MODELS = ["tiny", "base", "small", "large-v3-turbo"]
@@ -93,7 +93,26 @@ CLEANING_PRESETS = {
 # ── GPU detection ────────────────────────────────────────────────────────────
 DEVICE = "cpu"
 COMPUTE = "int8"
-DEVICE_LABEL = "CPU (9950X)"
+DEVICE_LABEL = "CPU"
+
+def _detect_cpu_name():
+    try:
+        import platform
+        return platform.processor() or "CPU"
+    except Exception:
+        return "CPU"
+
+def _detect_gpu_name():
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().split("\n")[0]
+    except Exception:
+        pass
+    return "CUDA GPU"
 
 try:
     import site
@@ -118,9 +137,12 @@ try:
     if ctranslate2.get_cuda_device_count() > 0:
         DEVICE = "cuda"
         COMPUTE = "float16"
-        DEVICE_LABEL = "GPU (4080S)"
+        DEVICE_LABEL = f"GPU ({_detect_gpu_name()})"
 except Exception:
     pass
+
+if DEVICE == "cpu":
+    DEVICE_LABEL = f"CPU ({_detect_cpu_name()})"
 
 # ── Tray icons ───────────────────────────────────────────────────────────────
 def _circle(color):
@@ -201,23 +223,81 @@ class Settings:
     model_name: str = "large-v3-turbo"
     lang_name: str = "Auto-detect"
     mic_name: str = ""
-    clean_model: str = "gemini-2.5-flash-lite"
+    clean_provider: str = "Gemini"
+    clean_model: str = "gemini-3.1-flash-lite-preview"
+    # Per-provider API keys (so users can switch without re-entering)
     gemini_api_key: str = ""
+    openai_api_key: str = ""
+    anthropic_api_key: str = ""
+    groq_api_key: str = ""
+    hotkey_record: str = "Ctrl+Alt+F12"
+    hotkey_repaste: str = "Ctrl+Alt+F11"
     silence_timeout: float = 2.5
     output_mode: str = "Auto-paste"
     cleaning_preset: str = "General"
     output_file: str = ""
     audio_feedback: bool = False
 
+    def get_api_key(self):
+        """Return the API key for the currently selected provider."""
+        key_map = {
+            "Gemini": self.gemini_api_key,
+            "OpenAI": self.openai_api_key,
+            "Anthropic": self.anthropic_api_key,
+            "Groq": self.groq_api_key,
+            "Ollama": "",
+        }
+        return key_map.get(self.clean_provider, "")
+
+    def set_api_key(self, key):
+        """Set the API key for the currently selected provider."""
+        attr = {
+            "Gemini": "gemini_api_key",
+            "OpenAI": "openai_api_key",
+            "Anthropic": "anthropic_api_key",
+            "Groq": "groq_api_key",
+        }.get(self.clean_provider)
+        if attr:
+            setattr(self, attr, key)
+
     @classmethod
     def load(cls):
         try:
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+            settings = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
         except Exception:
-            return cls()
+            settings = cls()
+        # Try to load API keys from keyring (overrides empty file values)
+        try:
+            import keyring
+            for provider, attr in [
+                ("gemini", "gemini_api_key"), ("openai", "openai_api_key"),
+                ("anthropic", "anthropic_api_key"), ("groq", "groq_api_key"),
+            ]:
+                val = keyring.get_password("zenscribe", provider)
+                if val and not getattr(settings, attr):
+                    setattr(settings, attr, val)
+        except Exception:
+            pass
+        return settings
 
     def save(self):
+        data = asdict(self)
+        # Strip API keys from the saved file if keyring is available
+        saved_to_keyring = False
+        try:
+            import keyring
+            for provider, attr in [
+                ("gemini", "gemini_api_key"), ("openai", "openai_api_key"),
+                ("anthropic", "anthropic_api_key"), ("groq", "groq_api_key"),
+            ]:
+                val = data.get(attr, "")
+                if val:
+                    keyring.set_password("zenscribe", provider, val)
+                    data[attr] = ""  # Don't write to disk
+            saved_to_keyring = True
+        except Exception:
+            pass  # Fall back to plain text in settings.json
         tmp = SETTINGS_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.replace(str(tmp), str(SETTINGS_FILE))

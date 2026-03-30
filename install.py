@@ -1,94 +1,37 @@
 #!/usr/bin/env python3
 """
-install.py  —  One-time setup for Whisper app.
-Generates whisper.ico from the project favicon SVG and creates a
-Start Menu shortcut so you can pin it like a normal app.
+install.py  —  One-time setup for ZenScribe.
+Converts the icon PNG to .ico and creates Start Menu + Startup shortcuts.
 
 Run once: python install.py
 """
-import math
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 HERE        = Path(__file__).parent.resolve()
+ICON_PNG    = HERE / "icon_concepts" / "zenscribe_icon_final.png"
 ICO_OUT     = HERE / "whisper.ico"
 SCRIPT      = HERE / "whisper.py"
 PYTHONW     = Path(sys.executable).parent / "pythonw.exe"
-START_MENU  = Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/Whisper.lnk"
-
-# ── Icon renderer ─────────────────────────────────────────────────────────────
-# Reproduces E:\dev\claude_code\website\Logos\favicon.svg at multiple sizes.
-# SVG is 512×512 with:
-#   • Rounded-rect background  #2C2C2C  rx=64
-#   • Diamond outline          #FFFFFF  stroke-width=36  (miter join)
-#   • Chevron                  #4ECDB8  stroke-width=36
-
-def _polygon_outline(draw: ImageDraw.ImageDraw, points, color, width):
-    """Draw a closed polygon outline with thick lines and approximate miter joins."""
-    n = len(points)
-    for i in range(n):
-        draw.line([points[i], points[(i + 1) % n]], fill=color, width=width)
-    # Fill corners with circles to approximate mitered joins
-    r = width // 2
-    for x, y in points:
-        draw.ellipse([x - r, y - r, x + r, y + r], fill=color)
-
-
-def _polyline(draw: ImageDraw.ImageDraw, points, color, width):
-    """Draw an open polyline with thick lines and rounded end-caps."""
-    for i in range(len(points) - 1):
-        draw.line([points[i], points[i + 1]], fill=color, width=width)
-    r = width // 2
-    for x, y in points:
-        draw.ellipse([x - r, y - r, x + r, y + r], fill=color)
-
-
-def render_icon(size: int) -> Image.Image:
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    s = size / 512.0
-
-    # Background — rounded rectangle
-    rx = max(1, round(64 * s))
-    draw.rounded_rectangle([0, 0, size - 1, size - 1], radius=rx, fill="#2C2C2C")
-
-    sw = max(2, round(36 * s))  # stroke width scaled
-
-    # Diamond:  M 256 80 L 376 200 L 256 320 L 136 200 Z
-    diamond = [
-        (round(256 * s), round(80 * s)),
-        (round(376 * s), round(200 * s)),
-        (round(256 * s), round(320 * s)),
-        (round(136 * s), round(200 * s)),
-    ]
-    _polygon_outline(draw, diamond, "#FFFFFF", sw)
-
-    # Chevron:  M 136 272 L 256 392 L 376 272
-    chevron = [
-        (round(136 * s), round(272 * s)),
-        (round(256 * s), round(392 * s)),
-        (round(376 * s), round(272 * s)),
-    ]
-    _polyline(draw, chevron, "#4ECDB8", sw)
-
-    return img
+START_MENU  = Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/ZenScribe.lnk"
 
 
 def build_ico():
-    print("Building whisper.ico ...")
-    # Render at high resolution; Pillow rescales to each requested size
-    master = render_icon(256)
-    master.save(
-        ICO_OUT,
-        format="ICO",
-        sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
-    )
+    if not ICON_PNG.exists():
+        print(f"Icon source not found: {ICON_PNG}")
+        print("Run the app first or place zenscribe_icon_final.png in icon_concepts/")
+        return False
+    print("Building whisper.ico from ZenScribe icon...")
+    img = Image.open(ICON_PNG).convert("RGBA")
+    sizes = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+    img.save(ICO_OUT, format="ICO", sizes=sizes)
     print(f"  -> {ICO_OUT}")
+    return True
 
 
 # ── Shortcut creator ──────────────────────────────────────────────────────────
@@ -99,7 +42,7 @@ $lnk.TargetPath       = "{target}"
 $lnk.Arguments        = '"{script}"'
 $lnk.WorkingDirectory = "{workdir}"
 $lnk.IconLocation     = "{icon},0"
-$lnk.Description      = "Whisper — Voice to text"
+$lnk.Description      = "ZenScribe — Voice to text, cleaned by AI"
 $lnk.Save()
 Write-Host "Shortcut created: {lnk}"
 """
@@ -132,13 +75,13 @@ def create_shortcut():
         print(f"  -> {START_MENU}")
         print()
         print("To pin to Start Menu:")
-        print("  1. Press Win key and type 'Whisper'")
+        print("  1. Press Win key and type 'ZenScribe'")
         print("  2. Right-click the app -> 'Pin to Start'")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    build_ico()
-    create_shortcut()
+    if build_ico():
+        create_shortcut()
     print()
-    print("Done! Run 'Whisper' from the Start Menu (no terminal window).")
+    print("Done! Run 'ZenScribe' from the Start Menu (no terminal window).")
