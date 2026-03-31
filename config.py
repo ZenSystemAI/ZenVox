@@ -21,7 +21,7 @@ if getattr(sys, 'frozen', False):
 else:
     APP_DIR = Path(__file__).parent
 SETTINGS_FILE = APP_DIR / "settings.json"
-LOG_FILE = APP_DIR / "whisper.log"
+LOG_FILE = APP_DIR / "zenvox.log"
 DB_FILE = APP_DIR / "history.db"
 
 # ── Audio ────────────────────────────────────────────────────────────────────
@@ -171,16 +171,34 @@ if DEVICE == "cpu":
     DEVICE_LABEL = f"CPU ({_detect_cpu_name()})"
 
 # ── Tray icons ───────────────────────────────────────────────────────────────
-def _circle(color):
+def _load_tray_icon():
+    """Load the ZenVox logo PNG for tray icon use, fallback to a simple circle."""
+    logo_path = APP_DIR / "zenvox_logo.png"
+    if not logo_path.exists():
+        # Check source tree location
+        logo_path = Path(__file__).parent / "zenvox_logo.png"
+    if logo_path.exists():
+        try:
+            return Image.open(logo_path).convert("RGBA").resize((64, 64), Image.LANCZOS)
+        except Exception:
+            pass
+    # Fallback: simple circle
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    ImageDraw.Draw(img).ellipse([4, 4, 60, 60], fill=color)
+    ImageDraw.Draw(img).ellipse([4, 4, 60, 60], fill="#41BFA8")
     return img
 
+def _tinted_icon(base, color, alpha=100):
+    """Apply a color tint overlay to indicate state."""
+    overlay = Image.new("RGBA", base.size, color + (alpha,))
+    return Image.alpha_composite(base.copy(), overlay)
+
+_BASE_ICON = _load_tray_icon()
+
 ICONS = {
-    "idle":         _circle("#4caf50"),
-    "recording":    _circle("#ef5350"),
-    "transcribing": _circle("#ff9800"),
-    "loading":      _circle("#9e9e9e"),
+    "idle":         _BASE_ICON,
+    "recording":    _tinted_icon(_BASE_ICON, (239, 83, 80), 100),
+    "transcribing": _tinted_icon(_BASE_ICON, (255, 152, 0), 100),
+    "loading":      _tinted_icon(_BASE_ICON, (158, 158, 158), 120),
 }
 
 # ── Audio feedback (in-memory WAV) ───────────────────────────────────────────
@@ -219,7 +237,7 @@ BEEP_STOP = _double_wav(600, 400, 100, 50, 0.3)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 def setup_logging():
-    logger = logging.getLogger("whisper")
+    logger = logging.getLogger("zenvox")
     if logger.handlers:
         return logger
     logger.setLevel(logging.DEBUG)

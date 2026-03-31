@@ -2,7 +2,7 @@
 name = "zenvox"
 version = "1.0.0"
 description = "Voice to text, cleaned by AI. Fast, private, always ready."
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = "MIT"
 authors = [
     { name = "ZenSystem" },
@@ -37,8 +37,8 @@ all = [
 gpu = ["ctranslate2>=4.5"]
 
 [project.scripts]
-zenvox = "whisper:main"
+zenvox = "zenvox:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"

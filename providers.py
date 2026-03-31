@@ -4,7 +4,7 @@ Supports: Gemini, OpenAI, Anthropic, Groq, Ollama
 """
 import logging
 
-log = logging.getLogger("whisper")
+log = logging.getLogger("zenvox")
 
 # Provider name → (default model, label)
 PROVIDERS = {

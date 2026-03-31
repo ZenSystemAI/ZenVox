@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-whisper.py  —  ZenVox: Voice to text, cleaned by AI.
+zenvox.py  —  ZenVox: Voice to text, cleaned by AI.
 Ctrl+Alt+F12 = record (auto-stops on silence)
 Ctrl+Alt+F11 = re-paste last transcription
 """
-import concurrent.futures
 import os
 import sys
+
+if sys.platform != "win32":
+    print("ZenVox requires Windows 10/11. See README.md for details.")
+    sys.exit(1)
+
+import concurrent.futures
 import threading
 import time
 import warnings
@@ -43,7 +48,7 @@ log = setup_logging()
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENGINE — Recording, transcription, cleaning. Thread-safe.
 # ═══════════════════════════════════════════════════════════════════════════════
-class WhisperEngine:
+class ZenVoxEngine:
     def __init__(self, settings):
         self.settings = settings
         self._lock = threading.Lock()
@@ -378,7 +383,7 @@ class FloatingOverlay:
 # ═══════════════════════════════════════════════════════════════════════════════
 # APP — GUI + Tray + Hotkey + Orchestration
 # ═══════════════════════════════════════════════════════════════════════════════
-class WhisperApp:
+class ZenVoxApp:
     # ZenVox palette
     BG     = "#0F0F0F"
     PANEL  = "#191919"
@@ -394,7 +399,7 @@ class WhisperApp:
         if not self.settings.mic_name and self.input_devs:
             self.settings.mic_name = self.input_devs[0][1]
 
-        self.engine = WhisperEngine(self.settings)
+        self.engine = ZenVoxEngine(self.settings)
         self.history = History()
         self.last_text = ""
         self._last_pasted = ""
@@ -407,7 +412,7 @@ class WhisperApp:
         self.root.geometry("720x700")
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
-        ico = APP_DIR / "whisper.ico"
+        ico = APP_DIR / "zenvox.ico"
         if ico.exists():
             self.root.iconbitmap(str(ico))
 
@@ -836,6 +841,7 @@ class WhisperApp:
             self.root.deiconify(), self.root.lift(), self.root.focus_force()))
 
     def _quit(self, icon, item):
+        self.history.close()
         self.icon.stop()
         self.root.after(0, self.root.quit)
 
@@ -1022,7 +1028,7 @@ class WhisperApp:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
-    WhisperApp()
+    ZenVoxApp()
 
 
 if __name__ == "__main__":

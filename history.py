@@ -76,3 +76,7 @@ class History:
         with self._lock:
             self._db.execute("DELETE FROM transcriptions")
             self._db.commit()
+
+    def close(self):
+        with self._lock:
+            self._db.close()

@@ -20,8 +20,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [3/3] Copying icon...
-copy /y whisper.ico "dist\ZenVox\whisper.ico" >nul 2>&1
+echo [3/3] Copying assets...
+copy /y zenvox.ico "dist\ZenVox\zenvox.ico" >nul 2>&1
+copy /y zenvox_logo.png "dist\ZenVox\zenvox_logo.png" >nul 2>&1
 
 echo.
 echo ========================================

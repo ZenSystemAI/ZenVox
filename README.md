@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="icon_concepts/zenvox_icon_final.png" alt="ZenVox" width="120" />
+  <img src="zenvox_logo.png" alt="ZenVox" width="120" />
   <h1 align="center">ZenVox</h1>
   <p align="center">
     <strong>Voice to text. Cleaned by AI. Yours to keep.</strong>
@@ -147,15 +147,16 @@ Other tools either butcher the French, translate everything to English, or choke
 ```bash
 git clone https://github.com/ZenSystemAI/ZenVox.git
 cd ZenVox
-python install.py
-python whisper.py
+pip install ".[all,gpu]"   # or pip install . for CPU-only with no cleaning providers
+python zenvox.py
 ```
 
-The install script sets up a venv and installs all dependencies (including CUDA support if you have an NVIDIA GPU).
+Optionally, run `python install.py` to create a Start Menu shortcut and `.ico` file.
 
 ### Option 3: Build the .exe yourself
 
 ```bash
+pip install ".[all,gpu]"
 python install.py
 build.bat
 # Output: dist/ZenVox/ZenVox.exe
@@ -194,15 +195,15 @@ All settings are persisted in `settings.json` next to the executable. API keys a
 ## Architecture
 
 ```
-whisper.py      Main app — engine, overlay, GUI, tray, hotkeys
+zenvox.py       Main app — engine, overlay, GUI, tray, hotkeys
 config.py       Settings, constants, GPU detection, audio generation
 providers.py    Multi-provider LLM cleaning (Gemini, OpenAI, Anthropic, Groq, Ollama)
 history.py      SQLite-backed transcription history with search
-install.py      One-command setup (venv + deps + CUDA)
+install.py      Icon conversion + Start Menu shortcut
 build.bat       PyInstaller build script
 ```
 
-The app follows a clean separation: `WhisperEngine` (thread-safe recording/transcription/cleaning) is completely independent from `WhisperApp` (GUI/tray/hotkeys). You could use the engine headlessly if you wanted.
+The app follows a clean separation: `ZenVoxEngine` (thread-safe recording/transcription/cleaning) is completely independent from `ZenVoxApp` (GUI/tray/hotkeys). You could use the engine headlessly if you wanted.
 
 ---
 

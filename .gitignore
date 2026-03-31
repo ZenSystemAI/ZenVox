@@ -4,9 +4,11 @@ settings.json
 history.db
 history.db-shm
 history.db-wal
+zenvox.log
+zenvox.log.*
 whisper.log
 whisper.log.*
-*.ico
 dist/
 build/
 *.egg-info/
+.claude/

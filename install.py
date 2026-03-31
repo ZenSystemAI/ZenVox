@@ -14,9 +14,9 @@ from PIL import Image
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 HERE        = Path(__file__).parent.resolve()
-ICON_PNG    = HERE / "icon_concepts" / "zenvox_icon_final.png"
-ICO_OUT     = HERE / "whisper.ico"
-SCRIPT      = HERE / "whisper.py"
+ICON_PNG    = HERE / "zenvox_logo.png"
+ICO_OUT     = HERE / "zenvox.ico"
+SCRIPT      = HERE / "zenvox.py"
 PYTHONW     = Path(sys.executable).parent / "pythonw.exe"
 START_MENU  = Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/ZenVox.lnk"
 
@@ -24,9 +24,9 @@ START_MENU  = Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Progra
 def build_ico():
     if not ICON_PNG.exists():
         print(f"Icon source not found: {ICON_PNG}")
-        print("Run the app first or place zenvox_icon_final.png in icon_concepts/")
+        print("Run the app first or place zenvox_logo.png in the project root")
         return False
-    print("Building whisper.ico from ZenVox icon...")
+    print("Building zenvox.ico from ZenVox logo...")
     img = Image.open(ICON_PNG).convert("RGBA")
     sizes = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
     img.save(ICO_OUT, format="ICO", sizes=sizes)

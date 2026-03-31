@@ -85,12 +85,12 @@ if ort_pkg_dir:
                 print(f"  ORT: {f} -> {rel}")
 
 a = Analysis(
-    ['whisper.py'],
+    ['zenvox.py'],
     pathex=[],
     binaries=nvidia_bins + ct2_bins + ort_bins,
     datas=[
-        ('whisper.ico', '.'),
-        ('icon_concepts/zenvox_icon_final.png', 'icon_concepts'),
+        ('zenvox.ico', '.'),
+        ('zenvox_logo.png', '.'),
     ] + vad_data + [
         (ctk_dir, 'customtkinter'),
     ],
@@ -138,7 +138,7 @@ exe = EXE(
     upx=False,
     console=False,  # No console window — windowed app
     disable_windowed_traceback=False,
-    icon='whisper.ico',
+    icon='zenvox.ico',
 )
 
 coll = COLLECT(
