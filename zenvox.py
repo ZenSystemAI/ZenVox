@@ -459,7 +459,7 @@ class ZenVoxApp:
         ctk.CTkLabel(si, text="  Voice to Text", font=("Inter Tight", 14),
                      text_color=M).pack(side="left")
         ctk.CTkLabel(si, textvariable=self.gui_status, font=("Inter", 13),
-                     text_color=TL).pack(side="right")
+                     text_color="#a1a1aa").pack(side="right")
 
         # ─── Tabs ───
         tabs = ctk.CTkTabview(
@@ -515,9 +515,15 @@ class ZenVoxApp:
         rf.pack(fill="x", padx=24, pady=(0, 8))
         ri = ctk.CTkFrame(rf, fg_color="transparent")
         ri.pack(fill="x", padx=16, pady=10)
+        # Record button — prominent, unmistakable primary action
+        self._rec_btn = ctk.CTkButton(
+            ri, text="\u25cf", width=40, height=40, corner_radius=20,
+            fg_color="#ef5350", hover_color="#c62828", text_color="#fff",
+            font=("Inter", 20), command=self._gui_toggle_record)
+        self._rec_btn.pack(side="left", padx=(0, 12))
         self._level_bar = ctk.CTkProgressBar(
             ri, progress_color="#ef5350", fg_color=B,
-            height=8, width=200, corner_radius=4)
+            height=8, width=180, corner_radius=4)
         self._level_bar.pack(side="left", padx=(0, 12))
         self._level_bar.set(0)
         self._timer_label = ctk.CTkLabel(ri, text="Ready",
@@ -531,7 +537,7 @@ class ZenVoxApp:
 
         # Row 1: Model, Language, Mic
         r1 = ctk.CTkFrame(sp, fg_color="transparent")
-        r1.pack(fill="x", padx=20, pady=(10, 6))
+        r1.pack(fill="x", padx=20, pady=(12, 8))
         self.gui_model = ctk.StringVar(value=self.settings.model_name)
         ctk.CTkComboBox(
             r1, variable=self.gui_model, values=MODELS, width=155,
@@ -556,7 +562,9 @@ class ZenVoxApp:
 
         # Row 2: Provider + API key + Model
         r2 = ctk.CTkFrame(sp, fg_color="transparent")
-        r2.pack(fill="x", padx=20, pady=(0, 6))
+        r2.pack(fill="x", padx=20, pady=(0, 8))
+        ctk.CTkLabel(r2, text="AI:", font=("Inter", 12, "bold"),
+                     text_color=M, width=25).pack(side="left", padx=(0, 4))
         self.gui_provider = ctk.StringVar(value=self.settings.clean_provider)
         ctk.CTkComboBox(
             r2, variable=self.gui_provider, values=PROVIDER_NAMES, width=105,
@@ -566,7 +574,7 @@ class ZenVoxApp:
             command=self._on_provider).pack(side="left", padx=(0, 8))
         self.gui_key = ctk.StringVar(value=self.settings.get_api_key())
         self._key_entry = ctk.CTkEntry(r2, textvariable=self.gui_key, show="*",
-                          placeholder_text="API key...", width=200,
+                          placeholder_text="API key", width=200,
                           fg_color=B, border_color=BD, text_color=T, font=("Inter", 12))
         self._key_entry.pack(side="left", padx=(0, 8))
         self._key_entry.bind("<FocusOut>", lambda e: self._on_key())
@@ -580,7 +588,7 @@ class ZenVoxApp:
 
         # Row 3: Silence, Output, Cleaning preset
         r3 = ctk.CTkFrame(sp, fg_color="transparent")
-        r3.pack(fill="x", padx=20, pady=(0, 10))
+        r3.pack(fill="x", padx=20, pady=(0, 12))
         ctk.CTkLabel(r3, text="Silence:", font=("Inter", 12),
                      text_color=M).pack(side="left", padx=(0, 4))
         self.gui_silence = ctk.StringVar(value=str(self.settings.silence_timeout))
@@ -621,9 +629,13 @@ class ZenVoxApp:
         hk_rec = self.settings.hotkey_record.lower()
         hk_rep = self.settings.hotkey_repaste.lower()
         ctk.CTkLabel(ff, text=f"{hk_rec} = record  \u00b7  {hk_rep} = re-paste",
-                     font=("Inter", 11), text_color=M).pack(side="left")
+                     font=("Inter", 12), text_color="#a1a1aa").pack(side="left")
 
     # ── GUI Callbacks ─────────────────────────────────────────────────────
+    def _gui_toggle_record(self):
+        """Record button click — same as hotkey toggle."""
+        self._toggle()
+
     def _gui_copy(self):
         if self.last_text:
             pyperclip.copy(self.last_text)
@@ -768,15 +780,22 @@ class ZenVoxApp:
             self._timer_label.configure(
                 text=f"Recording  {timer_str}",
                 text_color="#ef5350")
+            # Button shows stop icon during recording
+            self._rec_btn.configure(text="\u25a0", fg_color="#c62828",
+                                    hover_color="#b71c1c")
             self._overlay.update_timer(timer_str)
             self._timer_job = self.root.after(100, self._update_rec_bar)
         elif self.engine.is_transcribing:
             self._level_bar.set(0)
             self._timer_label.configure(text="Transcribing...",
                                         text_color="#ff9800")
+            self._rec_btn.configure(text="\u25cf", fg_color=self.BORDER,
+                                    hover_color=self.BORDER)
         else:
             self._level_bar.set(0)
             self._timer_label.configure(text="Ready", text_color=self.MUTED)
+            self._rec_btn.configure(text="\u25cf", fg_color="#ef5350",
+                                    hover_color="#c62828")
 
     # ── Tray Menu ─────────────────────────────────────────────────────────
     def _build_menu(self):
