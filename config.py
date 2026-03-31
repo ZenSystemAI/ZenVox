@@ -170,35 +170,18 @@ except Exception:
 if DEVICE == "cpu":
     DEVICE_LABEL = f"CPU ({_detect_cpu_name()})"
 
-# ── Tray icons ───────────────────────────────────────────────────────────────
-def _load_tray_icon():
-    """Load the ZenVox logo PNG for tray icon use, fallback to a simple circle."""
-    logo_path = APP_DIR / "zenvox_logo.png"
-    if not logo_path.exists():
-        # Check source tree location
-        logo_path = Path(__file__).parent / "zenvox_logo.png"
-    if logo_path.exists():
-        try:
-            return Image.open(logo_path).convert("RGBA").resize((64, 64), Image.LANCZOS)
-        except Exception:
-            pass
-    # Fallback: simple circle
+# ── Tray icons (colored dots — not the app logo) ────────────────────────────
+def _dot_icon(color):
+    """Create a solid colored circle for the system tray."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    ImageDraw.Draw(img).ellipse([4, 4, 60, 60], fill="#41BFA8")
+    ImageDraw.Draw(img).ellipse([4, 4, 60, 60], fill=color)
     return img
 
-def _tinted_icon(base, color, alpha=100):
-    """Apply a color tint overlay to indicate state."""
-    overlay = Image.new("RGBA", base.size, color + (alpha,))
-    return Image.alpha_composite(base.copy(), overlay)
-
-_BASE_ICON = _load_tray_icon()
-
 ICONS = {
-    "idle":         _BASE_ICON,
-    "recording":    _tinted_icon(_BASE_ICON, (239, 83, 80), 100),
-    "transcribing": _tinted_icon(_BASE_ICON, (255, 152, 0), 100),
-    "loading":      _tinted_icon(_BASE_ICON, (158, 158, 158), 120),
+    "idle":         _dot_icon("#41BFA8"),   # green — ready
+    "recording":    _dot_icon("#EF5350"),   # red — recording
+    "transcribing": _dot_icon("#FF9800"),   # orange — transcribing
+    "loading":      _dot_icon("#9E9E9E"),   # grey — loading
 }
 
 # ── Audio feedback (in-memory WAV) ───────────────────────────────────────────
