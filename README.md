@@ -147,16 +147,20 @@ Other tools either butcher the French, translate everything to English, or choke
 ```bash
 git clone https://github.com/ZenSystemAI/ZenVox.git
 cd ZenVox
-pip install ".[all,gpu]"   # or pip install . for CPU-only with no cleaning providers
-python zenvox.py
+python install.py
 ```
 
-Optionally, run `python install.py` to create a Start Menu shortcut and `.ico` file.
+That's it. The install script creates a venv, installs all dependencies, auto-detects your GPU for CUDA acceleration, builds the app icon, and creates a Start Menu shortcut.
+
+```bash
+# Then run it:
+.venv\Scripts\pythonw.exe zenvox.py
+# Or launch "ZenVox" from the Start Menu
+```
 
 ### Option 3: Build the .exe yourself
 
 ```bash
-pip install ".[all,gpu]"
 python install.py
 build.bat
 # Output: dist/ZenVox/ZenVox.exe
@@ -199,7 +203,7 @@ zenvox.py       Main app — engine, overlay, GUI, tray, hotkeys
 config.py       Settings, constants, GPU detection, audio generation
 providers.py    Multi-provider LLM cleaning (Gemini, OpenAI, Anthropic, Groq, Ollama)
 history.py      SQLite-backed transcription history with search
-install.py      Icon conversion + Start Menu shortcut
+install.py      One-command setup (venv + deps + GPU + shortcuts)
 build.bat       PyInstaller build script
 ```
 
