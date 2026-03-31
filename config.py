@@ -324,7 +324,10 @@ class Settings:
                     data[attr] = ""  # Don't write to disk
             saved_to_keyring = True
         except Exception:
-            pass  # Fall back to plain text in settings.json
+            import logging as _logging
+            _logging.getLogger("zenvox").warning(
+                "keyring unavailable — API keys stored in plaintext settings.json")
+            # Fall back to plain text in settings.json
         tmp = SETTINGS_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.replace(str(tmp), str(SETTINGS_FILE))

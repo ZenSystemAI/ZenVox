@@ -12,6 +12,7 @@ if sys.platform != "win32":
     sys.exit(1)
 
 import concurrent.futures
+import queue
 import threading
 import time
 import warnings
@@ -66,14 +67,17 @@ class ZenVoxEngine:
         self._last_toggle = 0.0
         self._vad_h = self._vad_c = self._vad_context = None
         self._on_vad_stop = None
+        self._vad_queue = None
 
     @property
     def is_recording(self):
-        return self._recording
+        with self._lock:
+            return self._recording
 
     @property
     def is_transcribing(self):
-        return self._transcribing
+        with self._lock:
+            return self._transcribing
 
     @property
     def model_loaded(self):
@@ -111,8 +115,9 @@ class ZenVoxEngine:
         now = time.time()
         if now - self._last_toggle < 0.4:
             return False
-        if not self.model_loaded or self._transcribing:
-            return False
+        with self._lock:
+            if self._whisper_model is None or self._transcribing:
+                return False
         self._last_toggle = now
         return True
 
@@ -133,6 +138,10 @@ class ZenVoxEngine:
         self._vad_context = np.zeros(64, dtype="float32")
         self.play_start_sound()
 
+        self._vad_queue = queue.Queue(maxsize=32)
+        if self._vad_model is not None:
+            threading.Thread(target=self._run_vad_worker, daemon=True).start()
+
         def cb(indata, frames, t, status):
             if status:
                 log.warning(f"Audio: {status}")
@@ -141,7 +150,10 @@ class ZenVoxEngine:
             self._audio_chunks.append(indata.copy())
             self._audio_level = min(1.0, float(np.abs(indata).max()) * 5)
             if self._vad_model is not None:
-                self._check_vad(indata.flatten())
+                try:
+                    self._vad_queue.put_nowait(indata.flatten().copy())
+                except queue.Full:
+                    pass
 
         try:
             self._stream = sd.InputStream(
@@ -160,6 +172,11 @@ class ZenVoxEngine:
             if not self._recording:
                 return None, 0.0
             self._recording = False
+        if self._vad_queue is not None:
+            try:
+                self._vad_queue.put_nowait(None)  # sentinel — stop VAD worker
+            except queue.Full:
+                pass
         duration = time.time() - self._record_start
         self.play_stop_sound()
         try:
@@ -177,9 +194,23 @@ class ZenVoxEngine:
         log.info(f"Recorded {duration:.1f}s, {len(audio)} samples")
         return audio, duration
 
+    def _run_vad_worker(self):
+        """VAD inference loop — runs on a dedicated background thread, not the audio callback."""
+        while True:
+            chunk = self._vad_queue.get()
+            if chunk is None:
+                break
+            if not self._recording:
+                break
+            try:
+                self._check_vad(chunk)
+            except Exception as e:
+                log.error(f"VAD worker: {e}")
+
     # ── Transcription ─────────────────────────────────────────────────────
     def transcribe(self, audio, on_segment=None):
-        self._transcribing = True
+        with self._lock:
+            self._transcribing = True
         try:
             if len(audio) < SAMPLE_RATE * 0.3:
                 return ""
@@ -201,7 +232,8 @@ class ZenVoxEngine:
             log.error(f"Transcribe: {e}")
             return ""
         finally:
-            self._transcribing = False
+            with self._lock:
+                self._transcribing = False
 
     # ── AI cleaning ───────────────────────────────────────────────────────
     def clean_text(self, text):
@@ -222,8 +254,11 @@ class ZenVoxEngine:
                     return text
                 return result
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
                 result = ex.submit(_call).result(timeout=15)
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
             log.info(f"Clean: {result[:120]!r}")
             return result
         except concurrent.futures.TimeoutError:
