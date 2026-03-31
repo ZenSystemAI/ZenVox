@@ -22,13 +22,13 @@ dependencies = [
 
 [project.optional-dependencies]
 # Cleaning providers — install the ones you want to use
-gemini = ["google-generativeai>=0.8"]
+gemini = ["google-genai>=1.0"]
 openai = ["openai>=1.0"]
 anthropic = ["anthropic>=0.80"]
 groq = ["groq>=0.9"]
 # All providers
 all = [
-    "google-generativeai>=0.8",
+    "google-genai>=1.0",
     "openai>=1.0",
     "anthropic>=0.80",
     "groq>=0.9",

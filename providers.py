@@ -33,22 +33,21 @@ class CleaningProvider:
 class GeminiProvider(CleaningProvider):
     def __init__(self, api_key, model_name, system_prompt):
         super().__init__(api_key, model_name, system_prompt)
-        self._model = None
+        self._client = None
 
-    def _get_model(self):
-        if self._model is None:
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            self._model = genai.GenerativeModel(
-                model_name=self.model_name,
-                system_instruction=self.system_prompt)
-        return self._model
+    def _get_client(self):
+        if self._client is None:
+            from google import genai
+            self._client = genai.Client(api_key=self.api_key)
+        return self._client
 
     def clean(self, raw_text, max_tokens=4096):
-        model = self._get_model()
-        r = model.generate_content(
-            f"[RAW] {raw_text} [/RAW]",
-            generation_config={
+        client = self._get_client()
+        r = client.models.generate_content(
+            model=self.model_name,
+            contents=f"[RAW] {raw_text} [/RAW]",
+            config={
+                "system_instruction": self.system_prompt,
                 "temperature": 0.2,
                 "max_output_tokens": max_tokens,
             })

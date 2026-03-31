@@ -22,7 +22,7 @@ if sys.executable.lower().endswith("pythonw.exe"):
     sys.stdout = open(os.devnull, "w")
     sys.stderr = open(os.devnull, "w")
 
-warnings.filterwarnings("ignore", module="google.generativeai")
+warnings.filterwarnings("ignore", module="google.genai")
 
 import customtkinter as ctk
 import numpy as np

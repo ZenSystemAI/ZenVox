@@ -105,7 +105,7 @@ a = Analysis(
         'sounddevice',
         'pyperclip',
         'pyautogui',
-        'google.generativeai',
+        'google.genai',
         'openai',
         'anthropic',
     ],
