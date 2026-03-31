@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="700" height="200" viewBox="0 0 700 200">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0F0F0F"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+  </defs>
+  <rect width="700" height="200" rx="16" fill="url(#bg)"/>
+  
+  <!-- ZenVox side -->
+  <rect x="30" y="30" width="300" height="140" rx="12" fill="#191919" stroke="#4ECDB8" stroke-width="2"/>
+  <text x="180" y="65" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="18" font-weight="bold" fill="#4ECDB8">ZenVox</text>
+  <text x="180" y="100" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="42" font-weight="bold" fill="#e4e4e7">$0</text>
+  <text x="180" y="125" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="14" fill="#71717a">/month, forever</text>
+  <text x="180" y="155" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" fill="#4ECDB8">Local STT + BYOK cleaning + open source</text>
+
+  <!-- VS -->
+  <text x="350" y="108" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="16" font-weight="bold" fill="#71717a">vs</text>
+
+  <!-- Wispr Flow side -->
+  <rect x="370" y="30" width="300" height="140" rx="12" fill="#191919" stroke="#27272a" stroke-width="1"/>
+  <text x="520" y="65" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="18" font-weight="bold" fill="#71717a">The Other Guys</text>
+  <text x="520" y="100" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="42" font-weight="bold" fill="#ef5350">$192</text>
+  <text x="520" y="125" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="14" fill="#71717a">/year, locked in</text>
+  <text x="520" y="155" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" fill="#71717a">Cloud STT + their API only + closed source</text>
+</svg>
