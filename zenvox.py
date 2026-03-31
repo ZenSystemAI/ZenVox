@@ -204,9 +204,7 @@ class ZenVoxEngine:
         """VAD inference loop — runs on a dedicated background thread, not the audio callback."""
         while True:
             chunk = self._vad_queue.get()
-            if chunk is None:
-                break
-            if not self._recording:
+            if chunk is None:  # sentinel — drain complete, exit cleanly
                 break
             try:
                 self._check_vad(chunk)
