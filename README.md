@@ -118,10 +118,15 @@ Other tools either butcher the French, translate everything to English, or choke
 
 ### Desktop Experience
 
-<!-- TODO: Add screenshot of the main window (dark theme, settings panel visible) -->
-<!-- TODO: Add screenshot of the floating overlay pill during recording -->
-<!-- TODO: Add screenshot of the system tray menu -->
-<!-- Dimensions: 800px wide, dark background to match the app theme -->
+<p align="center">
+  <img src=".github/screenshot-main.jpg" alt="ZenVox main window — dark theme, settings, transcription panel" width="700" />
+</p>
+
+<p align="center">
+  <img src=".github/screenshot-overlay.jpg" alt="Floating recording overlay — always on top" height="40" />
+  &nbsp;&nbsp;&nbsp;
+  <img src=".github/screenshot-tray.jpg" alt="System tray — green dot when ready, RTX 4080 SUPER detected" height="60" />
+</p>
 - **System tray** — lives in your taskbar, always ready
 - **Floating overlay** — pill-shaped indicator at the bottom of your screen during recording/transcription (like Otter.ai)
 - **Audio feedback** — optional beep on record start/stop
