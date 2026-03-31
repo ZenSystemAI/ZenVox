@@ -39,6 +39,9 @@ gpu = ["ctranslate2>=4.5"]
 [project.scripts]
 zenvox = "zenvox:main"
 
+[tool.setuptools]
+py-modules = ["zenvox", "config", "providers", "history"]
+
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
