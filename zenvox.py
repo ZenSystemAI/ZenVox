@@ -68,6 +68,7 @@ class ZenVoxEngine:
         self._vad_h = self._vad_c = self._vad_context = None
         self._on_vad_stop = None
         self._vad_queue = None
+        self._vad_worker_thread = None
 
     @property
     def is_recording(self):
@@ -139,8 +140,10 @@ class ZenVoxEngine:
         self.play_start_sound()
 
         self._vad_queue = queue.Queue(maxsize=32)
+        self._vad_worker_thread = None
         if self._vad_model is not None:
-            threading.Thread(target=self._run_vad_worker, daemon=True).start()
+            self._vad_worker_thread = threading.Thread(target=self._run_vad_worker, daemon=True)
+            self._vad_worker_thread.start()
 
         def cb(indata, frames, t, status):
             if status:
@@ -177,6 +180,9 @@ class ZenVoxEngine:
                 self._vad_queue.put_nowait(None)  # sentinel — stop VAD worker
             except queue.Full:
                 pass
+        if self._vad_worker_thread is not None:
+            self._vad_worker_thread.join(timeout=2.0)  # wait for VAD to drain before checking _speech_detected
+            self._vad_worker_thread = None
         duration = time.time() - self._record_start
         self.play_stop_sound()
         try:
