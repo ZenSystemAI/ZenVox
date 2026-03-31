@@ -790,12 +790,12 @@ class ZenVoxApp:
             self._timer_label.configure(text="Transcribing...",
                                         text_color="#ff9800")
             self._rec_btn.configure(text="\u25cf", fg_color=self.BORDER,
-                                    hover_color=self.BORDER)
+                                    hover_color=self.BORDER, state="disabled")
         else:
             self._level_bar.set(0)
             self._timer_label.configure(text="Ready", text_color=self.MUTED)
             self._rec_btn.configure(text="\u25cf", fg_color="#ef5350",
-                                    hover_color="#c62828")
+                                    hover_color="#c62828", state="normal")
 
     # ── Tray Menu ─────────────────────────────────────────────────────────
     def _build_menu(self):
