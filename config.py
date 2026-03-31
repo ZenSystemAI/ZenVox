@@ -18,11 +18,16 @@ from PIL import Image, ImageDraw
 # In bundled app, __file__ is inside _internal/ — settings should be next to the .exe
 if getattr(sys, 'frozen', False):
     APP_DIR = Path(sys.executable).parent
+    # Data files go in %LOCALAPPDATA%\ZenVox — per-user, NTFS-protected
+    _localappdata = os.environ.get("LOCALAPPDATA", "")
+    DATA_DIR = (Path(_localappdata) / "ZenVox") if _localappdata else APP_DIR
 else:
     APP_DIR = Path(__file__).parent
-SETTINGS_FILE = APP_DIR / "settings.json"
-LOG_FILE = APP_DIR / "zenvox.log"
-DB_FILE = APP_DIR / "history.db"
+    DATA_DIR = APP_DIR  # Dev mode: keep files alongside source
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+SETTINGS_FILE = DATA_DIR / "settings.json"
+LOG_FILE = DATA_DIR / "zenvox.log"
+DB_FILE = DATA_DIR / "history.db"
 
 # ── Audio ────────────────────────────────────────────────────────────────────
 SAMPLE_RATE = 16000
@@ -116,7 +121,7 @@ def _detect_gpu_name():
             return result.stdout.strip().split("\n")[0]
     except Exception:
         pass
-    return "CUDA GPU"
+    return None  # Detection failed — caller should not claim a specific GPU name
 
 try:
     import ctypes as _ct
@@ -163,7 +168,8 @@ try:
     if ctranslate2.get_cuda_device_count() > 0:
         DEVICE = "cuda"
         COMPUTE = "float16"
-        DEVICE_LABEL = f"GPU ({_detect_gpu_name()})"
+        _gpu_name = _detect_gpu_name()
+        DEVICE_LABEL = f"GPU ({_gpu_name})" if _gpu_name else "GPU (CUDA)"
 except Exception:
     pass
 
@@ -244,6 +250,49 @@ def list_input_devices():
             seen.add(d["name"])
     return devs
 
+# ── DPAPI helpers (Windows credential encryption fallback) ───────────────────
+def _dpapi_encrypt(plaintext: str) -> str:
+    """Encrypt a string with Windows DPAPI (user-scoped). Returns 'dpapi:<b64>'."""
+    import base64
+    import ctypes
+
+    class _BLOB(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.c_uint), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+    data = plaintext.encode("utf-8")
+    src_buf = (ctypes.c_ubyte * len(data))(*data)
+    blob_in = _BLOB(len(data), src_buf)
+    blob_out = _BLOB()
+    ok = ctypes.windll.crypt32.CryptProtectData(
+        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out))
+    if not ok:
+        raise OSError("CryptProtectData failed")
+    encrypted = bytes(blob_out.pbData[:blob_out.cbData])
+    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+    return "dpapi:" + base64.b64encode(encrypted).decode("ascii")
+
+
+def _dpapi_decrypt(encoded: str) -> str:
+    """Decrypt a DPAPI-encrypted string. Returns plaintext."""
+    import base64
+    import ctypes
+
+    class _BLOB(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.c_uint), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+    encrypted = base64.b64decode(encoded[6:])  # strip "dpapi:" prefix
+    src_buf = (ctypes.c_ubyte * len(encrypted))(*encrypted)
+    blob_in = _BLOB(len(encrypted), src_buf)
+    blob_out = _BLOB()
+    ok = ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out))
+    if not ok:
+        raise OSError("CryptUnprotectData failed")
+    decrypted = bytes(blob_out.pbData[:blob_out.cbData]).decode("utf-8")
+    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+    return decrypted
+
+
 # ── Settings ─────────────────────────────────────────────────────────────────
 @dataclass
 class Settings:
@@ -260,6 +309,9 @@ class Settings:
     hotkey_record: str = "Ctrl+Alt+F12"
     hotkey_repaste: str = "Ctrl+Alt+F11"
     silence_timeout: float = 2.5
+    vad_threshold: float = 0.5
+    vad_neg_thresh: float = 0.35
+    ollama_endpoint: str = "http://localhost:11434/v1"
     output_mode: str = "Auto-paste"
     cleaning_preset: str = "General"
     output_file: str = ""
@@ -291,10 +343,18 @@ class Settings:
     def load(cls):
         try:
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            # Decrypt any DPAPI-encrypted API key fields before constructing settings
+            for attr in ("gemini_api_key", "openai_api_key", "anthropic_api_key", "groq_api_key"):
+                val = data.get(attr, "")
+                if isinstance(val, str) and val.startswith("dpapi:"):
+                    try:
+                        data[attr] = _dpapi_decrypt(val)
+                    except Exception:
+                        data[attr] = ""
             settings = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
         except Exception:
             settings = cls()
-        # Try to load API keys from keyring (overrides empty file values)
+        # Try to load API keys from keyring (overrides file values)
         try:
             import keyring
             for provider, attr in [
@@ -310,24 +370,29 @@ class Settings:
 
     def save(self):
         data = asdict(self)
-        # Strip API keys from the saved file if keyring is available
-        saved_to_keyring = False
+        # Priority: keyring → DPAPI-encrypted → plaintext (last resort with warning)
+        _key_attrs = [
+            ("gemini", "gemini_api_key"), ("openai", "openai_api_key"),
+            ("anthropic", "anthropic_api_key"), ("groq", "groq_api_key"),
+        ]
         try:
             import keyring
-            for provider, attr in [
-                ("gemini", "gemini_api_key"), ("openai", "openai_api_key"),
-                ("anthropic", "anthropic_api_key"), ("groq", "groq_api_key"),
-            ]:
+            for provider, attr in _key_attrs:
                 val = data.get(attr, "")
                 if val:
                     keyring.set_password("zenvox", provider, val)
                     data[attr] = ""  # Don't write to disk
-            saved_to_keyring = True
         except Exception:
-            import logging as _logging
-            _logging.getLogger("zenvox").warning(
-                "keyring unavailable — API keys stored in plaintext settings.json")
-            # Fall back to plain text in settings.json
+            # Keyring unavailable — fall back to DPAPI encryption
+            try:
+                for _, attr in _key_attrs:
+                    val = data.get(attr, "")
+                    if val and not val.startswith("dpapi:"):
+                        data[attr] = _dpapi_encrypt(val)
+            except Exception:
+                import logging as _logging
+                _logging.getLogger("zenvox").warning(
+                    "keyring and DPAPI both unavailable — API keys stored in plaintext settings.json")
         tmp = SETTINGS_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.replace(str(tmp), str(SETTINGS_FILE))

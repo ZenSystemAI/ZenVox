@@ -127,15 +127,17 @@ class GroqProvider(CleaningProvider):
 
 
 class OllamaProvider(CleaningProvider):
-    def __init__(self, api_key, model_name, system_prompt):
+    def __init__(self, api_key, model_name, system_prompt,
+                 endpoint="http://localhost:11434/v1"):
         super().__init__(api_key, model_name, system_prompt)
+        self.endpoint = endpoint
         self._client = None
 
     def _get_client(self):
         if self._client is None:
             from openai import OpenAI
             self._client = OpenAI(
-                base_url="http://localhost:11434/v1",
+                base_url=self.endpoint,
                 api_key="ollama")
         return self._client
 
@@ -161,9 +163,11 @@ _PROVIDER_MAP = {
 }
 
 
-def create_provider(provider_name, api_key, model_name, system_prompt):
+def create_provider(provider_name, api_key, model_name, system_prompt, endpoint=None):
     """Factory: create the right provider instance."""
     cls = _PROVIDER_MAP.get(provider_name)
     if cls is None:
         raise ValueError(f"Unknown provider: {provider_name}")
+    if provider_name == "Ollama" and endpoint:
+        return cls(api_key, model_name, system_prompt, endpoint=endpoint)
     return cls(api_key, model_name, system_prompt)

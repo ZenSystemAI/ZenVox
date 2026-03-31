@@ -27,11 +27,15 @@ VENV_PIP     = VENV_DIR / "Scripts" / "pip.exe"
 START_MENU = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/ZenVox.lnk"
 
 
-def _run(cmd, desc=None):
+def _run(cmd, desc=None, timeout=600):
     """Run a command, print output live, raise on failure."""
     if desc:
         print(f"\n  {desc}")
-    result = subprocess.run(cmd, cwd=str(HERE))
+    try:
+        result = subprocess.run(cmd, cwd=str(HERE), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"  ERROR: command timed out after {timeout}s")
+        sys.exit(1)
     if result.returncode != 0:
         print(f"  ERROR: command failed with exit code {result.returncode}")
         sys.exit(1)

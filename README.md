@@ -95,7 +95,7 @@ Five LLM providers, because your voice-to-text app shouldn't lock you into one v
 
 Four cleaning presets:
 - **General** — removes filler words, fixes punctuation, preserves bilingual mix
-- **Technical** — preserves camelCase, CLI flags, converts "dot" → `.` in code context
+- **Technical** — preserves camelCase, CLI flags; converts spoken symbols: "dot" → `.`, "slash" → `/`, "dash" → `-`, "underscore" → `_`, "equals" → `=`, "colon" → `:`, "open paren" → `(`, "close paren" → `)`
 - **Minimal** — only fixes typos and capitalization, keeps everything else
 - **Structured** — adds paragraph breaks and bullet lists from rambling speech
 
@@ -132,7 +132,7 @@ Other tools either butcher the French, translate everything to English, or choke
 - **Audio feedback** — optional beep on record start/stop
 - **Configurable hotkeys** — change from Ctrl+Alt+F12 to whatever you want
 - **History** — full searchable history with raw + cleaned text, duration, model used
-- **API keys in Windows Keyring** — not sitting in a plain text config file
+- **API keys in Windows Keyring** — not sitting in a plain text config file. Falls back to DPAPI-encrypted storage if Keyring is unavailable (still user-scoped, never plaintext unless all else fails)
 
 ---
 
@@ -179,7 +179,7 @@ build.bat
 
 ## Configuration
 
-All settings are persisted in `settings.json` next to the executable. API keys are stored in Windows Credential Manager when available.
+All settings are persisted in `settings.json`. When running as a bundled `.exe`, ZenVox stores its data files (`settings.json`, `history.db`, `zenvox.log`) in `%LOCALAPPDATA%\ZenVox\` — a per-user, NTFS-protected location. When running from source, files stay next to the script. API keys are stored in Windows Credential Manager when available, falling back to DPAPI-encrypted values in `settings.json`.
 
 | Setting | Default | What it does |
 |---------|---------|-------------|

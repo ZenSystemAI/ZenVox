@@ -35,7 +35,7 @@ from datetime import datetime
 
 from config import (
     Settings, SETTINGS_FILE,
-    SAMPLE_RATE, VAD_THRESHOLD, VAD_NEG_THRESH, CPU_THREADS, NUM_WORKERS,
+    SAMPLE_RATE, CPU_THREADS, NUM_WORKERS,
     MODELS, LANGS, CLEANING_PRESETS, OUTPUT_MODES, ICONS,
     DEVICE, COMPUTE, DEVICE_LABEL, BEEP_START, BEEP_STOP,
     setup_logging, list_input_devices, APP_DIR,
@@ -278,10 +278,10 @@ class ZenVoxEngine:
             probs, self._vad_h, self._vad_c = self._vad_model.session.run(
                 None, {"input": frame, "h": self._vad_h, "c": self._vad_c})
             p = float(probs[0])
-            if p >= VAD_THRESHOLD:
+            if p >= self.settings.vad_threshold:
                 self._speech_detected = True
                 self._silence_start = None
-            elif p < VAD_NEG_THRESH and self._speech_detected:
+            elif p < self.settings.vad_neg_thresh and self._speech_detected:
                 if self._silence_start is None:
                     self._silence_start = time.time()
                 elif time.time() - self._silence_start >= self.settings.silence_timeout:
@@ -301,7 +301,8 @@ class ZenVoxEngine:
                 preset = CLEANING_PRESETS.get(
                     self.settings.cleaning_preset, CLEANING_PRESETS["General"])
                 self._cleaning_provider = create_provider(
-                    provider_name, api_key, self.settings.clean_model, preset)
+                    provider_name, api_key, self.settings.clean_model, preset,
+                    endpoint=self.settings.ollama_endpoint if provider_name == "Ollama" else None)
             except Exception as e:
                 log.error(f"Provider init [{self.settings.clean_provider}]: {e}")
                 return None
@@ -744,19 +745,28 @@ class ZenVoxApp:
         self.settings.clean_model = default_model
         self.gui_clean.set(default_model)
         self._model_entry.configure(placeholder_text=default_model)
-        # Load the stored key for this provider
-        self.gui_key.set(self.settings.get_api_key())
-        # Hide/show key field based on provider
-        needs_key = PROVIDERS.get(new_provider, {}).get("needs_key", True)
-        if needs_key:
+        # Ollama: show endpoint URL (unmasked) instead of an API key
+        if new_provider == "Ollama":
+            self._key_entry.configure(show="", placeholder_text="http://localhost:11434/v1")
+            self.gui_key.set(self.settings.ollama_endpoint)
             self._key_entry.pack(side="left", padx=(0, 8), before=self._model_entry)
         else:
-            self._key_entry.pack_forget()
+            needs_key = PROVIDERS.get(new_provider, {}).get("needs_key", True)
+            self._key_entry.configure(show="*", placeholder_text="API key")
+            self.gui_key.set(self.settings.get_api_key())
+            if needs_key:
+                self._key_entry.pack(side="left", padx=(0, 8), before=self._model_entry)
+            else:
+                self._key_entry.pack_forget()
         self.engine.invalidate_provider()
         self.settings.save()
 
     def _on_key(self):
-        self.settings.set_api_key(self.gui_key.get())
+        if self.settings.clean_provider == "Ollama":
+            val = self.gui_key.get().strip()
+            self.settings.ollama_endpoint = val or "http://localhost:11434/v1"
+        else:
+            self.settings.set_api_key(self.gui_key.get())
         self.engine.invalidate_provider()
         self.settings.save()
 
@@ -1059,8 +1069,15 @@ class ZenVoxApp:
             time.sleep(0.05)
             pyautogui.hotkey("ctrl", "v")
             time.sleep(0.15)
+            # Only restore prev if: it existed, wasn't our last paste, AND clipboard
+            # still holds our text (user hasn't copied something new during the paste)
             if prev and prev != self._last_pasted:
-                pyperclip.copy(prev)
+                try:
+                    current = pyperclip.paste()
+                except Exception:
+                    current = text
+                if current == text:
+                    pyperclip.copy(prev)
             self._last_pasted = text
         elif mode == "Clipboard only":
             pyperclip.copy(text)
