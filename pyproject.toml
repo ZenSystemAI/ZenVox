@@ -34,8 +34,13 @@ all = [
     "anthropic>=0.80",
     "groq>=0.9",
 ]
-# GPU acceleration (NVIDIA CUDA)
-gpu = ["ctranslate2>=4.5"]
+# GPU acceleration (NVIDIA CUDA) — includes required cuBLAS/cuDNN runtime DLLs on Windows
+gpu = [
+    "ctranslate2>=4.5",
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12",
+    "nvidia-cuda-runtime-cu12",
+]
 
 [project.scripts]
 zenvox = "zenvox:main"
