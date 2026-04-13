@@ -1,6 +1,6 @@
 [project]
 name = "zenvox"
-version = "1.0.0"
+version = "1.1.0"
 description = "Voice to text, cleaned by AI. Fast, private, always ready."
 requires-python = ">=3.10"
 license = "MIT"
@@ -19,6 +19,7 @@ dependencies = [
     "Pillow>=12.0",
     "faster-whisper>=1.1",
     "keyring>=24.0",
+    "pynput>=1.7",
 ]
 
 [project.optional-dependencies]

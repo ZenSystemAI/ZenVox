@@ -15,12 +15,13 @@ import sounddevice as sd
 from PIL import Image, ImageDraw
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-# In bundled app, __file__ is inside _internal/ — settings should be next to the .exe
 if getattr(sys, 'frozen', False):
     APP_DIR = Path(sys.executable).parent
-    # Data files go in %LOCALAPPDATA%\ZenVox — per-user, NTFS-protected
-    _localappdata = os.environ.get("LOCALAPPDATA", "")
-    DATA_DIR = (Path(_localappdata) / "ZenVox") if _localappdata else APP_DIR
+    if sys.platform == "win32":
+        _localappdata = os.environ.get("LOCALAPPDATA", "")
+        DATA_DIR = (Path(_localappdata) / "ZenVox") if _localappdata else APP_DIR
+    else:
+        DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "zenvox"
 else:
     APP_DIR = Path(__file__).parent
     DATA_DIR = APP_DIR  # Dev mode: keep files alongside source
@@ -125,45 +126,47 @@ def _detect_gpu_name():
 
 try:
     import ctypes as _ct
-    import ctranslate2
+    import site as _site
 
-    # Search for CUDA DLLs in multiple locations:
-    # 1. PyInstaller _internal dir (bundled app)
-    # 2. nvidia pip packages (dev/pip install)
-    _dll_dirs = []
-
-    # Bundled app: DLLs are next to the exe in _internal/
-    if getattr(sys, 'frozen', False):
-        _internal = os.path.join(sys._MEIPASS)
-        if os.path.isdir(_internal):
-            _dll_dirs.append(_internal)
-
-    # Dev mode: nvidia pip packages
-    try:
-        import site as _site
+    def _preload_nvidia_libs():
+        """Preload NVIDIA CUDA shared libraries so ctranslate2/faster-whisper can find them.
+        On Linux, LD_LIBRARY_PATH is only read at process start, so we must use
+        ctypes.CDLL with RTLD_GLOBAL to make symbols available globally.
+        On Windows, we add DLL directories and preload each .dll."""
         for sp in _site.getsitepackages():
             nvidia_dir = os.path.join(sp, "nvidia")
             if not os.path.isdir(nvidia_dir):
                 continue
-            for pkg in os.listdir(nvidia_dir):
-                bin_dir = os.path.join(nvidia_dir, pkg, "bin")
-                if os.path.isdir(bin_dir):
-                    _dll_dirs.append(bin_dir)
-    except Exception:
-        pass
+            for pkg in sorted(os.listdir(nvidia_dir)):
+                if sys.platform == "win32":
+                    lib_dir = os.path.join(nvidia_dir, pkg, "bin")
+                else:
+                    lib_dir = os.path.join(nvidia_dir, pkg, "lib")
+                if not os.path.isdir(lib_dir):
+                    continue
+                if sys.platform == "win32":
+                    try:
+                        os.add_dll_directory(lib_dir)
+                    except OSError:
+                        pass
+                    os.environ["PATH"] = lib_dir + os.pathsep + os.environ.get("PATH", "")
+                    for f in os.listdir(lib_dir):
+                        if f.endswith(".dll"):
+                            try:
+                                _ct.CDLL(os.path.join(lib_dir, f))
+                            except Exception:
+                                pass
+                else:
+                    for f in sorted(os.listdir(lib_dir)):
+                        full = os.path.join(lib_dir, f)
+                        if f.endswith(".so") or (".so." in f and ".alt." not in f):
+                            try:
+                                _ct.CDLL(full, mode=_ct.RTLD_GLOBAL)
+                            except Exception:
+                                pass
 
-    for bin_dir in _dll_dirs:
-        try:
-            os.add_dll_directory(bin_dir)
-        except OSError:
-            pass
-        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
-        for dll in os.listdir(bin_dir):
-            if dll.endswith(".dll"):
-                try:
-                    _ct.CDLL(os.path.join(bin_dir, dll))
-                except Exception:
-                    pass
+    _preload_nvidia_libs()
+    import ctranslate2
 
     if ctranslate2.get_cuda_device_count() > 0:
         DEVICE = "cuda"
@@ -188,6 +191,7 @@ ICONS = {
     "recording":    _dot_icon("#EF5350"),   # red — recording
     "transcribing": _dot_icon("#FF9800"),   # orange — transcribing
     "loading":      _dot_icon("#9E9E9E"),   # grey — loading
+    "error":        _dot_icon("#B71C1C"),   # red — error
 }
 
 # ── Audio feedback (in-memory WAV) ───────────────────────────────────────────
@@ -234,7 +238,7 @@ def setup_logging():
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
     logger.addHandler(fh)
-    if not sys.executable.lower().endswith("pythonw.exe"):
+    if sys.platform != "win32" or not sys.executable.lower().endswith("pythonw.exe"):
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
         ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
@@ -250,50 +254,65 @@ def list_input_devices():
             seen.add(d["name"])
     return devs
 
-# ── DPAPI helpers (Windows credential encryption fallback) ───────────────────
-def _dpapi_encrypt(plaintext: str) -> str:
-    """Encrypt a string with Windows DPAPI (user-scoped). Returns 'dpapi:<b64>'."""
-    import base64
-    import ctypes
+# ── Platform credential helpers ──────────────────────────────────────────────
+if sys.platform == "win32":
+    def _dpapi_encrypt(plaintext: str) -> str:
+        """Encrypt a string with Windows DPAPI (user-scoped). Returns 'dpapi:<b64>'."""
+        import base64
+        import ctypes
 
-    class _BLOB(ctypes.Structure):
-        _fields_ = [("cbData", ctypes.c_uint), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+        class _BLOB(ctypes.Structure):
+            _fields_ = [("cbData", ctypes.c_uint), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
 
-    data = plaintext.encode("utf-8")
-    src_buf = (ctypes.c_ubyte * len(data))(*data)
-    blob_in = _BLOB(len(data), src_buf)
-    blob_out = _BLOB()
-    ok = ctypes.windll.crypt32.CryptProtectData(
-        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out))
-    if not ok:
-        raise OSError("CryptProtectData failed")
-    encrypted = bytes(blob_out.pbData[:blob_out.cbData])
-    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
-    return "dpapi:" + base64.b64encode(encrypted).decode("ascii")
+        data = plaintext.encode("utf-8")
+        src_buf = (ctypes.c_ubyte * len(data))(*data)
+        blob_in = _BLOB(len(data), src_buf)
+        blob_out = _BLOB()
+        ok = ctypes.windll.crypt32.CryptProtectData(
+            ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out))
+        if not ok:
+            raise OSError("CryptProtectData failed")
+        encrypted = bytes(blob_out.pbData[:blob_out.cbData])
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+        return "dpapi:" + base64.b64encode(encrypted).decode("ascii")
 
+    def _dpapi_decrypt(encoded: str) -> str:
+        """Decrypt a DPAPI-encrypted string. Returns plaintext."""
+        import base64
+        import ctypes
 
-def _dpapi_decrypt(encoded: str) -> str:
-    """Decrypt a DPAPI-encrypted string. Returns plaintext."""
-    import base64
-    import ctypes
+        class _BLOB(ctypes.Structure):
+            _fields_ = [("cbData", ctypes.c_uint), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
 
-    class _BLOB(ctypes.Structure):
-        _fields_ = [("cbData", ctypes.c_uint), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+        encrypted = base64.b64decode(encoded[6:])  # strip "dpapi:" prefix
+        src_buf = (ctypes.c_ubyte * len(encrypted))(*encrypted)
+        blob_in = _BLOB(len(encrypted), src_buf)
+        blob_out = _BLOB()
+        ok = ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out))
+        if not ok:
+            raise OSError("CryptUnprotectData failed")
+        decrypted = bytes(blob_out.pbData[:blob_out.cbData]).decode("utf-8")
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+        return decrypted
+else:
+    def _dpapi_encrypt(plaintext: str) -> str:
+        raise OSError("DPAPI not available on Linux")
 
-    encrypted = base64.b64decode(encoded[6:])  # strip "dpapi:" prefix
-    src_buf = (ctypes.c_ubyte * len(encrypted))(*encrypted)
-    blob_in = _BLOB(len(encrypted), src_buf)
-    blob_out = _BLOB()
-    ok = ctypes.windll.crypt32.CryptUnprotectData(
-        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out))
-    if not ok:
-        raise OSError("CryptUnprotectData failed")
-    decrypted = bytes(blob_out.pbData[:blob_out.cbData]).decode("utf-8")
-    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
-    return decrypted
+    def _dpapi_decrypt(encoded: str) -> str:
+        raise OSError("DPAPI not available on Linux")
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────
+KEYRING_SERVICE = "zenvox"
+API_KEY_FIELDS = (
+    ("gemini", "gemini_api_key"),
+    ("openai", "openai_api_key"),
+    ("anthropic", "anthropic_api_key"),
+    ("groq", "groq_api_key"),
+)
+
+
 @dataclass
 class Settings:
     model_name: str = "large-v3-turbo"
@@ -306,7 +325,7 @@ class Settings:
     openai_api_key: str = ""
     anthropic_api_key: str = ""
     groq_api_key: str = ""
-    hotkey_record: str = "Ctrl+Alt+F12"
+    hotkey_record: str = "f6"
     hotkey_repaste: str = "Ctrl+Alt+F11"
     silence_timeout: float = 2.5
     vad_threshold: float = 0.5
@@ -344,7 +363,7 @@ class Settings:
         try:
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
             # Decrypt any DPAPI-encrypted API key fields before constructing settings
-            for attr in ("gemini_api_key", "openai_api_key", "anthropic_api_key", "groq_api_key"):
+            for _, attr in API_KEY_FIELDS:
                 val = data.get(attr, "")
                 if isinstance(val, str) and val.startswith("dpapi:"):
                     try:
@@ -357,11 +376,8 @@ class Settings:
         # Try to load API keys from keyring (overrides file values)
         try:
             import keyring
-            for provider, attr in [
-                ("gemini", "gemini_api_key"), ("openai", "openai_api_key"),
-                ("anthropic", "anthropic_api_key"), ("groq", "groq_api_key"),
-            ]:
-                val = keyring.get_password("zenvox", provider)
+            for provider, attr in API_KEY_FIELDS:
+                val = keyring.get_password(KEYRING_SERVICE, provider)
                 if val and not getattr(settings, attr):
                     setattr(settings, attr, val)
         except Exception:
@@ -371,21 +387,22 @@ class Settings:
     def save(self):
         data = asdict(self)
         # Priority: keyring → DPAPI-encrypted → plaintext (last resort with warning)
-        _key_attrs = [
-            ("gemini", "gemini_api_key"), ("openai", "openai_api_key"),
-            ("anthropic", "anthropic_api_key"), ("groq", "groq_api_key"),
-        ]
         try:
             import keyring
-            for provider, attr in _key_attrs:
+            for provider, attr in API_KEY_FIELDS:
                 val = data.get(attr, "")
                 if val:
-                    keyring.set_password("zenvox", provider, val)
-                    data[attr] = ""  # Don't write to disk
+                    keyring.set_password(KEYRING_SERVICE, provider, val)
+                else:
+                    try:
+                        keyring.delete_password(KEYRING_SERVICE, provider)
+                    except Exception:
+                        keyring.set_password(KEYRING_SERVICE, provider, "")
+                data[attr] = ""  # Keep disk state consistent with keyring
         except Exception:
             # Keyring unavailable — fall back to DPAPI encryption
             try:
-                for _, attr in _key_attrs:
+                for _, attr in API_KEY_FIELDS:
                     val = data.get(attr, "")
                     if val and not val.startswith("dpapi:"):
                         data[attr] = _dpapi_encrypt(val)
