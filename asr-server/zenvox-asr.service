@@ -1,0 +1,16 @@
+[Unit]
+Description=ZenVox remote ASR (faster-whisper large-v3 on GPU 1)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/asr-server
+Environment=CUDA_VISIBLE_DEVICES=1
+Environment=ZENVOX_ASR_MODEL=large-v3
+Environment=ZENVOX_ASR_PORT=8771
+ExecStart=%h/asr-server/.venv/bin/python %h/asr-server/server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

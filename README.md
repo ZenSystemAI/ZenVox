@@ -7,7 +7,7 @@
   <p align="center">
     <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg" />
     <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-green.svg" />
-    <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-blue.svg" />
+    <img alt="Platform: Linux / Windows" src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-blue.svg" />
     <img alt="Whisper" src="https://img.shields.io/badge/STT-Faster--Whisper-orange.svg" />
     <img alt="5 LLM Providers" src="https://img.shields.io/badge/cleaning-5%20LLM%20providers-purple.svg" />
   </p>
@@ -33,10 +33,10 @@ ZenVox does the same thing for **$0**. Whisper runs locally. Cleaning runs throu
   <img src=".github/how-it-works.svg" alt="Speak → Whisper (local) → AI cleans → Auto-pasted" width="800" />
 </p>
 
-1. **Ctrl+Alt+F12** — start recording
-2. ZenVox listens. When you stop talking, it auto-stops (VAD silence detection — no button to click)
+1. **F6** — start recording (or **hold** F6 in push-to-talk mode)
+2. ZenVox listens. In toggle mode it auto-stops when you stop talking (Silero VAD silence detection); in push-to-talk it stops when you release the key
 3. Whisper transcribes your speech locally
-4. Your chosen LLM cleans the output — removes filler words, fixes punctuation, preserves meaning
+4. Your chosen LLM cleans the output — removes filler words, fixes punctuation, preserves meaning (or pick **Raw** to keep the exact words, no AI)
 5. The cleaned text is pasted wherever your cursor was
 
 **Ctrl+Alt+F11** — re-paste the last transcription (both hotkeys are configurable)
@@ -93,11 +93,43 @@ Five LLM providers, because your voice-to-text app shouldn't lock you into one v
 | **Groq** | llama-3.3-70b-versatile | Yes (free tier works) |
 | **Ollama** | llama3.2:3b | No (fully local) |
 
-Four cleaning presets:
+Cleaning styles:
 - **General** — removes filler words, fixes punctuation, preserves bilingual mix
 - **Technical** — preserves camelCase, CLI flags; converts spoken symbols: "dot" → `.`, "slash" → `/`, "dash" → `-`, "underscore" → `_`, "equals" → `=`, "colon" → `:`, "open paren" → `(`, "close paren" → `)`
 - **Minimal** — only fixes typos and capitalization, keeps everything else
 - **Structured** — adds paragraph breaks and bullet lists from rambling speech
+- **Email** — polishes dictation into a clean, professional email body
+- **Raw** — no AI cleanup at all; pastes the exact transcribed words (zero API calls)
+
+### Dictionary (custom vocabulary)
+
+Add words, names, and jargon in the **Dictionary** tab so they come out spelled correctly every time — the way Wispr Flow does it. Each entry corrects across three layers:
+
+1. **Bias** — feeds your terms to Whisper as hotwords, nudging the transcription toward the right spelling
+2. **Replace** — deterministic, word-boundary find/replace on the raw transcript (e.g. `zen vox` → `ZenVox`), so the spelling is locked in *before* the LLM ever sees it
+3. **Prompt** — tells the cleaning LLM these spellings are intentional, so it never "corrects" your brand names or French terms
+
+Mark an entry **Boost only** to bias Whisper without forcing a literal replacement. Stored in a local `dictionary.json` — never leaves your machine.
+
+### Capture modes
+- **Toggle** (default) — press F6 to start, it auto-stops on silence (or press again)
+- **Push-to-talk** — hold F6 to talk, release to stop (great for short snippets and noisy rooms). *X11/Windows; on Wayland it falls back to toggle.*
+
+### Where transcription runs
+In **Settings → Transcription → Run on**:
+- **This machine** (default) — faster-whisper locally; uses the GPU when free and falls back to CPU automatically if the GPU is busy or absent.
+- **Remote server** — POSTs audio to an OpenAI-compatible ASR endpoint (e.g. a spare GPU box) so your local GPU is never touched. Point it at any server exposing `POST /v1/audio/transcriptions`. A minimal server (`asr-server/server.py`) ships in this repo:
+
+  ```bash
+  # on the GPU box, in a venv with faster-whisper + fastapi + uvicorn:
+  CUDA_VISIBLE_DEVICES=1 ZENVOX_ASR_MODEL=large-v3 ZENVOX_ASR_PORT=8771 \
+      python server.py
+  ```
+
+  Audio leaves this machine but stays on your LAN (never the cloud).
+
+### Live preview
+Enable **Settings → Behavior → Live preview** to see partial text appear while you're still speaking. Best with a GPU or remote backend (it re-transcribes periodically, which is slow on CPU).
 
 ### Bilingual / Franglais
 
@@ -150,13 +182,17 @@ cd ZenVox
 python install.py
 ```
 
-That's it. The install script creates a venv, installs all dependencies, auto-detects your GPU for CUDA acceleration, builds the app icon, and creates a Start Menu shortcut.
+That's it. The install script creates a venv, installs all dependencies, auto-detects your GPU for CUDA acceleration, checks system packages (Linux), and creates a launcher (Start Menu shortcut on Windows, `.desktop` entry on Linux).
 
 ```bash
-# Then run it:
-.venv\Scripts\pythonw.exe zenvox.py
-# Or launch "ZenVox" from the Start Menu
+# Linux:
+.venv/bin/python zenvox.py        # or launch "ZenVox" from your app menu
+
+# Windows:
+.venv\Scripts\pythonw.exe zenvox.py   # or launch "ZenVox" from the Start Menu
 ```
+
+Tip: set `ZENVOX_SHOW_WINDOW=1` to open straight into the main window instead of starting hidden in the tray.
 
 ### Option 3: Build the .exe yourself
 
@@ -189,8 +225,9 @@ All settings are persisted in `settings.json`. When running as a bundled `.exe`,
 | `clean_model` | `gemini-3.1-flash-lite-preview` | Specific model for cleaning |
 | `silence_timeout` | `2.5` | Seconds of silence before auto-stop |
 | `output_mode` | `Auto-paste` | Where cleaned text goes |
-| `cleaning_preset` | `General` | Which cleaning prompt to use |
-| `hotkey_record` | `Ctrl+Alt+F12` | Start/stop recording |
+| `cleaning_preset` | `General` | Which cleaning style to use (`General`/`Technical`/`Minimal`/`Structured`/`Email`/`Raw`) |
+| `capture_mode` | `toggle` | `toggle` or `ptt` (push-to-talk) |
+| `hotkey_record` | `f6` | Start/stop recording (or hold, in push-to-talk) |
 | `hotkey_repaste` | `Ctrl+Alt+F11` | Re-paste last transcription |
 | `audio_feedback` | `false` | Beep on record start/stop |
 
@@ -213,10 +250,11 @@ The app follows a clean separation: `ZenVoxEngine` (thread-safe recording/transc
 
 ## Requirements
 
-- **Windows 10/11** (uses Win32 hotkey registration + system tray)
+- **Linux (X11)** or **Windows 10/11** — Linux uses AppIndicator tray + xdotool/xclip; Wayland works but push-to-talk falls back to toggle
 - **Python 3.10+** (if running from source)
 - **Microphone**
-- **NVIDIA GPU** (optional — for faster transcription via CUDA)
+- **NVIDIA GPU** (optional — for faster transcription via CUDA; ZenVox falls back to CPU automatically if the GPU is busy or absent)
+- **Linux system packages**: `xdotool`, `xclip` (X11) or `wl-clipboard`, `wtype` (Wayland), plus `python3-gi` + `gir1.2-ayatanaappindicator3-0.1` for the tray. `python install.py` checks these for you.
 
 ---
 

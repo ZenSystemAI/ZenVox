@@ -62,11 +62,15 @@ from config import (
     Settings, SETTINGS_FILE,
     SAMPLE_RATE, CPU_THREADS, NUM_WORKERS,
     MODELS, LANGS, CLEANING_PRESETS, OUTPUT_MODES, ICONS,
+    RAW_PRESET, PRESET_NAMES, CAPTURE_MODES, CAPTURE_TOGGLE, CAPTURE_PTT,
+    TRANSCRIPTION_BACKENDS, BACKEND_LOCAL, BACKEND_REMOTE,
     DEVICE, COMPUTE, DEVICE_LABEL, BEEP_START, BEEP_STOP,
-    setup_logging, list_input_devices, APP_DIR,
+    NO_SPEECH_PEAK_FLOOR, MAX_RECORD_SECONDS, STUCK_PIPELINE_TIMEOUT,
+    setup_logging, list_input_devices, detect_ui_scale, APP_DIR,
 )
 from providers import PROVIDERS, PROVIDER_NAMES, create_provider
 from history import History
+from dictionary import Dictionary, DictionaryEntry
 
 log = setup_logging()
 
@@ -445,11 +449,48 @@ def _simulate_paste(window=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# REMOTE ASR — encode + POST to an OpenAI-compatible transcription endpoint
+# ═══════════════════════════════════════════════════════════════════════════════
+def _audio_to_wav_bytes(audio, sample_rate=SAMPLE_RATE):
+    """16kHz float32 mono → 16-bit PCM WAV bytes (for the multipart upload)."""
+    import wave
+    pcm = (np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _post_multipart_audio(url, wav_bytes, fields, timeout=60.0):
+    """Minimal multipart/form-data POST (no requests dependency). Returns parsed JSON."""
+    import json as _json
+    from urllib import request as _req
+    boundary = "----zenvox" + os.urandom(12).hex()
+    pre = []
+    for name, value in fields.items():
+        pre.append(f"--{boundary}\r\n".encode())
+        pre.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        pre.append(f"{value}\r\n".encode())
+    pre.append(f"--{boundary}\r\n".encode())
+    pre.append(b'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n')
+    pre.append(b"Content-Type: audio/wav\r\n\r\n")
+    body = b"".join(pre) + wav_bytes + f"\r\n--{boundary}--\r\n".encode()
+    req = _req.Request(url, data=body, method="POST",
+                       headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with _req.urlopen(req, timeout=timeout) as resp:
+        return _json.loads(resp.read().decode("utf-8"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ENGINE — Recording, transcription, cleaning. Thread-safe.
 # ═══════════════════════════════════════════════════════════════════════════════
 class ZenVoxEngine:
     def __init__(self, settings):
         self.settings = settings
+        self.dictionary = Dictionary.load()
         self._lock = threading.Lock()
         self._whisper_model = None
         self._loaded_model_name = None
@@ -468,6 +509,13 @@ class ZenVoxEngine:
         self._on_vad_stop = None
         self._vad_queue = None
         self._vad_worker_thread = None
+        self._native_rate = SAMPLE_RATE
+        self._stop_requested = False
+        self._vad_autostop = True  # False in push-to-talk (release controls stop)
+        self._infer_lock = threading.Lock()  # serialize model use (preview vs final)
+        self._on_partial = None
+        self._preview_thread = None
+        self.active_device_label = DEVICE_LABEL
 
     @property
     def is_recording(self):
@@ -479,9 +527,58 @@ class ZenVoxEngine:
         with self._lock:
             return self._transcribing
 
+    def force_reset(self):
+        """Recovery hook: fully release recording/transcribing so a fresh start
+        always works. Clearing only the flag would leave a live InputStream and
+        VAD worker held — the next start_recording would no-op and the hotkey
+        would stay dead."""
+        with self._lock:
+            self._recording = False
+            self._transcribing = False
+        try:
+            self._stop_vad_worker()
+        except Exception as e:
+            log.error(f"force_reset vad worker: {e}")
+        try:
+            if self._stream:
+                self._stream.stop()
+                self._stream.close()
+                self._stream = None
+        except Exception as e:
+            log.error(f"force_reset stream close: {e}")
+
+    def _request_stop(self):
+        """One-shot gate shared by the VAD-silence and max-duration stop paths.
+        Returns True exactly once per recording so _on_vad_stop never double-fires."""
+        with self._lock:
+            if self._stop_requested or not self._recording:
+                return False
+            self._stop_requested = True
+        return True
+
+    def _fire_stop(self):
+        """Trigger the auto-stop callback at most once, safely from any thread
+        (audio callback or VAD worker). Never raises into the realtime path."""
+        if not self._request_stop():
+            return
+        cb = self._on_vad_stop
+        if cb:
+            try:
+                cb()
+            except Exception as e:
+                log.error(f"on_vad_stop failed: {e}")
+
     @property
     def model_loaded(self):
         with self._lock:
+            return self._whisper_model is not None
+
+    @property
+    def is_ready(self):
+        """Ready to record? Local needs the Whisper model; remote needs only VAD."""
+        with self._lock:
+            if self.settings.transcription_backend == BACKEND_REMOTE:
+                return self._vad_model is not None
             return self._whisper_model is not None
 
     @property
@@ -507,31 +604,66 @@ class ZenVoxEngine:
         from faster_whisper import WhisperModel
         from faster_whisper.vad import get_vad_model
         target_model = model_name or self.settings.model_name
-        whisper_model = WhisperModel(
-            target_model, device=DEVICE, compute_type=COMPUTE,
-            cpu_threads=CPU_THREADS, num_workers=NUM_WORKERS)
+
+        # Remote backend: transcription happens on the server, so don't load a
+        # local Whisper model at all (saves the local GPU/CPU). Still load VAD —
+        # silence auto-stop runs locally and is tiny (ONNX on CPU).
+        if self.settings.transcription_backend == BACKEND_REMOTE:
+            vad_model = get_vad_model()
+            with self._lock:
+                self._whisper_model = None
+                self._vad_model = vad_model
+                self._loaded_model_name = "(remote)"
+                self._cleaning_provider = None
+                self.active_device_label = "Remote (P620)"
+            self._get_cleaning_provider()
+            log.info("Remote backend active — local Whisper not loaded")
+            return
+
+        def _build(device, compute):
+            return WhisperModel(
+                target_model, device=device, compute_type=compute,
+                cpu_threads=CPU_THREADS, num_workers=NUM_WORKERS)
+
+        device, compute, label = DEVICE, COMPUTE, DEVICE_LABEL
+        try:
+            whisper_model = _build(device, compute)
+        except Exception as e:
+            # The GPU is often shared (vLLM / ComfyUI hold VRAM) — a CUDA OOM at
+            # load must NOT kill the app. Fall back to CPU so dictation still
+            # works; the user can reload onto GPU later when VRAM frees.
+            if device == "cuda":
+                log.warning(f"GPU model load failed ({e}); falling back to CPU")
+                device, compute, label = "cpu", "int8", "CPU (GPU busy)"
+                whisper_model = _build(device, compute)
+            else:
+                raise
         vad_model = get_vad_model()
         with self._lock:
             self._whisper_model = whisper_model
             self._vad_model = vad_model
             self._loaded_model_name = target_model
             self._cleaning_provider = None
+            self.active_device_label = label
         self._get_cleaning_provider()
-        log.info(f"Loaded {target_model} on {DEVICE_LABEL}")
+        log.info(f"Loaded {target_model} on {label}")
 
     # ── Toggle guard ──────────────────────────────────────────────────────
     def can_toggle(self):
         now = time.time()
         if now - self._last_toggle < 0.4:
             return False
+        remote = self.settings.transcription_backend == BACKEND_REMOTE
         with self._lock:
-            if self._whisper_model is None or self._transcribing:
+            not_ready = self._vad_model is None if remote else self._whisper_model is None
+            if not_ready or self._transcribing:
                 return False
         self._last_toggle = now
         return True
 
     # ── Recording ─────────────────────────────────────────────────────────
-    def start_recording(self, device_id=None, on_vad_stop=None):
+    def start_recording(self, device_id=None, on_vad_stop=None, vad_autostop=True,
+                        on_partial=None):
         with self._lock:
             if self._recording:
                 return
@@ -542,16 +674,19 @@ class ZenVoxEngine:
         self._record_start = time.time()
         self._audio_level = 0.0
         self._on_vad_stop = on_vad_stop
+        self._on_partial = on_partial
+        self._preview_thread = None
+        self._stop_requested = False
+        # Push-to-talk: key release stops, so don't auto-stop on VAD silence
+        # (the max-duration safety cap still fires via the audio callback).
+        self._vad_autostop = vad_autostop
         self._vad_h = np.zeros((1, 1, 128), dtype="float32")
         self._vad_c = np.zeros((1, 1, 128), dtype="float32")
         self._vad_context = np.zeros(64, dtype="float32")
-        self.play_start_sound()
-
+        # Create the queue before the stream so early callbacks have somewhere
+        # to put data; the worker is only started once the stream opens cleanly.
         self._vad_queue = queue.Queue(maxsize=32)
         self._vad_worker_thread = None
-        if self._vad_model is not None:
-            self._vad_worker_thread = threading.Thread(target=self._run_vad_worker, daemon=True)
-            self._vad_worker_thread.start()
 
         def cb(indata, frames, t, status):
             if status:
@@ -565,41 +700,121 @@ class ZenVoxEngine:
                     self._vad_queue.put_nowait(indata.flatten().copy())
                 except queue.Full:
                     pass
+            # Safety net: a wedged VAD must never record forever. _fire_stop is
+            # one-shot and swallows exceptions so it can't abort the PortAudio
+            # stream from this realtime callback thread.
+            if time.time() - self._record_start >= MAX_RECORD_SECONDS:
+                log.warning(f"Max recording length ({MAX_RECORD_SECONDS}s) reached — auto-stopping")
+                self._fire_stop()
 
-        # Always record at the device's native sample rate to avoid
-        # ALSA silently returning empty data when rate is unsupported.
-        # Audio is resampled to SAMPLE_RATE (16kHz) in stop_recording().
+        # Open the input stream with fallbacks. PortAudio fails in many ways
+        # (busy device, unsupported sample rate, "illegal I/O combination",
+        # reordered device indices); try several (device, rate) combinations so a
+        # transient ALSA quirk does not look like a dead hotkey. Audio is recorded
+        # at whatever rate works and resampled to 16kHz in stop_recording().
         try:
-            dev_info = sd.query_devices(device_id) if device_id is not None else sd.query_devices(kind='input')
-            self._native_rate = int(dev_info["default_samplerate"])
-        except Exception:
-            self._native_rate = SAMPLE_RATE
-        try:
-            self._stream = sd.InputStream(
-                samplerate=self._native_rate, channels=1, dtype="float32",
-                blocksize=int(512 * self._native_rate / SAMPLE_RATE),
-                device=device_id, callback=cb)
-            self._stream.start()
-            log.info(f"Recording (dev={device_id}, rate={self._native_rate})")
+            native_rate = SAMPLE_RATE
+            try:
+                dev_info = (sd.query_devices(device_id) if device_id is not None
+                            else sd.query_devices(kind='input'))
+                native_rate = int(dev_info["default_samplerate"])
+            except Exception as e:
+                log.warning(f"Could not query device {device_id} rate: {e}")
+            candidates, seen = [], set()
+            for dev, rate in [
+                (device_id, native_rate), (device_id, SAMPLE_RATE),
+                (device_id, 48000), (device_id, 44100),
+                (None, native_rate), (None, SAMPLE_RATE),
+            ]:
+                if rate and (dev, rate) not in seen:
+                    seen.add((dev, rate))
+                    candidates.append((dev, rate))
+            last_err = None
+            for dev, rate in candidates:
+                try:
+                    stream = sd.InputStream(
+                        samplerate=rate, channels=1, dtype="float32",
+                        blocksize=int(512 * rate / SAMPLE_RATE),
+                        device=dev, callback=cb)
+                    self._native_rate = rate  # set before start(): callbacks fire after
+                    self._stream = stream
+                    stream.start()
+                    log.info(f"Recording (dev={dev}, rate={rate})")
+                    break
+                except Exception as e:
+                    last_err = e
+                    log.warning(f"Mic open failed (dev={dev}, rate={rate}): {e}")
+            else:
+                raise last_err or RuntimeError("No working audio input device")
         except Exception as e:
             log.error(f"Mic failed: {e}")
             with self._lock:
                 self._recording = False
             raise
 
+        self.play_start_sound()
+        if self._vad_model is not None:
+            self._vad_worker_thread = threading.Thread(target=self._run_vad_worker, daemon=True)
+            self._vad_worker_thread.start()
+        if self._on_partial is not None and getattr(self.settings, "live_preview", False):
+            self._preview_thread = threading.Thread(target=self._run_preview_worker, daemon=True)
+            self._preview_thread.start()
+
+    def _run_preview_worker(self):
+        """Live preview: periodically transcribe the audio-so-far and emit a
+        partial via on_partial. Best-effort — serialized with the final result by
+        _infer_lock, and never blocks or alters it."""
+        interval = max(0.6, float(getattr(self.settings, "preview_interval", 1.5)))
+        last_len = 0
+        while self._recording:
+            time.sleep(interval)
+            if not self._recording:
+                break
+            chunks = list(self._audio_chunks)
+            if not chunks:
+                continue
+            try:
+                audio = np.concatenate(chunks, axis=0).flatten().astype(np.float32)
+                if len(audio) < SAMPLE_RATE * 0.6 or len(audio) == last_len:
+                    continue
+                last_len = len(audio)
+                if self._native_rate != SAMPLE_RATE:
+                    audio = self._resample_linear(audio, self._native_rate, SAMPLE_RATE)
+                if self.settings.transcription_backend == BACKEND_REMOTE:
+                    text = self._transcribe_remote(audio)
+                else:
+                    text = self._transcribe_local(audio)
+                if text and self._recording and self._on_partial:
+                    self._on_partial(text)
+            except Exception as e:
+                log.debug(f"preview worker: {e}")
+
+    def _stop_vad_worker(self):
+        """Signal the VAD worker to drain its queue and exit, then join it."""
+        if self._vad_queue is not None:
+            try:
+                self._vad_queue.put_nowait(None)  # sentinel
+            except queue.Full:
+                # Queue full: clear one slot so the sentinel lands and the worker exits.
+                try:
+                    self._vad_queue.get_nowait()
+                    self._vad_queue.put_nowait(None)
+                except (queue.Empty, queue.Full):
+                    pass
+        if self._vad_worker_thread is not None:
+            self._vad_worker_thread.join(timeout=2.0)
+            self._vad_worker_thread = None
+
     def stop_recording(self):
         with self._lock:
             if not self._recording:
                 return None, 0.0
             self._recording = False
-        if self._vad_queue is not None:
-            try:
-                self._vad_queue.put_nowait(None)  # sentinel — stop VAD worker
-            except queue.Full:
-                pass
-        if self._vad_worker_thread is not None:
-            self._vad_worker_thread.join(timeout=2.0)  # wait for VAD to drain before checking _speech_detected
-            self._vad_worker_thread = None
+        # Drain VAD before reading _speech_detected so a late chunk isn't lost.
+        self._stop_vad_worker()
+        if self._preview_thread is not None:
+            self._preview_thread.join(timeout=2.0)  # _infer_lock guards the rest
+            self._preview_thread = None
         duration = time.time() - self._record_start
         self.play_stop_sound()
         try:
@@ -609,33 +824,44 @@ class ZenVoxEngine:
                 self._stream = None
         except Exception as e:
             log.error(f"Stream close: {e}")
+
+        audio = (np.concatenate(self._audio_chunks, axis=0).flatten().astype(np.float32)
+                 if self._audio_chunks else np.array([], dtype=np.float32))
+
+        # VAD can miss speech entirely (mis-tuned threshold, worker error, quiet
+        # mic). Don't silently drop audio that clearly contains an utterance:
+        # if the peak clears the energy floor and the clip is long enough,
+        # transcribe anyway and let Whisper's own VAD filter clean it up.
         if not self._speech_detected:
-            log.info("No speech")
-            return None, duration
-        audio = (np.concatenate(self._audio_chunks, axis=0).flatten()
-                 if self._audio_chunks else np.array([]))
-        # Resample to SAMPLE_RATE if recorded at a different rate
-        if self._native_rate != SAMPLE_RATE and len(audio) > 0:
-            num_samples = int(len(audio) * SAMPLE_RATE / self._native_rate)
-            indices = np.linspace(0, len(audio) - 1, num_samples).astype(np.float32)
-            idx_floor = np.floor(indices).astype(int)
-            idx_ceil = np.minimum(idx_floor + 1, len(audio) - 1)
-            frac = indices - idx_floor
-            audio = (audio[idx_floor] * (1 - frac) + audio[idx_ceil] * frac).astype(np.float32)
-            log.info(f"Resampled {self._native_rate}->{SAMPLE_RATE} Hz ({num_samples} samples)")
+            peak = float(np.abs(audio).max()) if len(audio) else 0.0
+            has_energy = peak >= NO_SPEECH_PEAK_FLOOR and len(audio) >= self._native_rate * 0.4
+            if not has_energy:
+                log.info(f"No speech (peak={peak:.4f}, {len(audio)} samples)")
+                return None, duration
+            log.info(f"VAD missed speech but audio has energy (peak={peak:.4f}) — transcribing anyway")
+
+        # Resample to SAMPLE_RATE using float64 indices. The old float32-index
+        # path overflowed past len(audio)-1 on long clips (>~16.7M samples) and
+        # crashed with IndexError, which killed the hotkey listener thread.
+        if self._native_rate != SAMPLE_RATE and len(audio) > 1:
+            audio = self._resample_linear(audio, self._native_rate, SAMPLE_RATE)
+            log.info(f"Resampled {self._native_rate}->{SAMPLE_RATE} Hz ({len(audio)} samples)")
         log.info(f"Recorded {duration:.1f}s, {len(audio)} samples")
         return audio, duration
 
+    @staticmethod
+    def _resample_linear(audio, src_rate, dst_rate):
+        """Linear resample with float64 indices (float32 indices overflow on long clips)."""
+        audio = np.asarray(audio, dtype=np.float32).flatten()
+        if len(audio) <= 1 or src_rate == dst_rate:
+            return audio
+        num_samples = max(1, int(round(len(audio) * dst_rate / src_rate)))
+        x = np.linspace(0.0, len(audio) - 1, num_samples)  # float64 — safe
+        return np.interp(x, np.arange(len(audio)), audio).astype(np.float32)
+
     def _resample_vad_chunk(self, chunk):
         """Resample a raw audio chunk from native device rate to 16kHz for VAD."""
-        chunk = np.asarray(chunk, dtype=np.float32).flatten()
-        if len(chunk) == 0 or self._native_rate == SAMPLE_RATE:
-            return chunk
-        return np.interp(
-            np.linspace(0, len(chunk), int(len(chunk) * SAMPLE_RATE / self._native_rate)),
-            np.arange(len(chunk)),
-            chunk,
-        ).astype(np.float32)
+        return self._resample_linear(chunk, self._native_rate, SAMPLE_RATE)
 
     def _run_vad_worker(self):
         """VAD inference loop — runs on a dedicated background thread, not the audio callback."""
@@ -652,26 +878,22 @@ class ZenVoxEngine:
     def transcribe(self, audio, on_segment=None):
         with self._lock:
             self._transcribing = True
-            model = self._whisper_model
         try:
             if len(audio) < SAMPLE_RATE * 0.3:
                 return ""
-            if model is None:
-                raise RuntimeError("Whisper model is not loaded")
-            lang = LANGS.get(self.settings.lang_name)
-            prompt = ("Transcription en fran\u00e7ais canadien."
-                      if self.settings.lang_name == "Fran\u00e7ais (CA)" else None)
-            segs, _ = model.transcribe(
-                audio, language=lang, beam_size=1,
-                initial_prompt=prompt, vad_filter=True)
-            parts = []
-            for s in segs:
-                parts.append(s.text)
-                if on_segment:
-                    on_segment(" ".join(parts).strip())
-            raw = " ".join(parts).strip()
-            log.info(f"Raw: {raw[:100]!r}")
-            return raw
+            if self.settings.transcription_backend == BACKEND_REMOTE:
+                raw = self._transcribe_remote(audio)
+            else:
+                raw = self._transcribe_local(audio, on_segment)
+            if not raw:
+                return ""
+            # Dictionary Layer B: deterministic correction on RAW text, before the
+            # LLM sees it \u2014 locks canonical spellings even on the raw-fallback path.
+            corrected = self.dictionary.apply_replacements(raw)
+            if corrected != raw:
+                log.info(f"Dictionary applied: {raw[:60]!r} -> {corrected[:60]!r}")
+            log.info(f"Raw: {corrected[:100]!r}")
+            return corrected
         except Exception as e:
             log.error(f"Transcribe: {e}")
             return ""
@@ -679,8 +901,59 @@ class ZenVoxEngine:
             with self._lock:
                 self._transcribing = False
 
+    def _lang_and_prompt(self):
+        lang = LANGS.get(self.settings.lang_name)
+        prompt = ("Transcription en fran\u00e7ais canadien."
+                  if self.settings.lang_name == "Fran\u00e7ais (CA)" else None)
+        return lang, prompt
+
+    def _transcribe_local(self, audio, on_segment=None):
+        with self._lock:
+            model = self._whisper_model
+        if model is None:
+            raise RuntimeError("Whisper model is not loaded")
+        lang, prompt = self._lang_and_prompt()
+        # Dictionary Layer A: bias the decode toward the user's spellings.
+        hotwords = self.dictionary.hotwords_string() or None
+        # _infer_lock serializes the model: the live-preview thread and the final
+        # transcription must never call faster-whisper concurrently.
+        with self._infer_lock:
+            segs, _ = model.transcribe(
+                audio, language=lang, beam_size=1,
+                initial_prompt=prompt, hotwords=hotwords, vad_filter=True)
+            parts = []
+            for s in segs:
+                parts.append(s.text)
+                if on_segment:
+                    on_segment(" ".join(parts).strip())
+            return " ".join(parts).strip()
+
+    def _transcribe_remote(self, audio):
+        """POST the clip to the OpenAI-compatible remote ASR server (e.g. P620)."""
+        lang, prompt = self._lang_and_prompt()
+        fields = {}
+        if lang:
+            fields["language"] = lang
+        if prompt:
+            fields["prompt"] = prompt
+        hotwords = self.dictionary.hotwords_string()
+        if hotwords:
+            fields["hotwords"] = hotwords
+        wav = _audio_to_wav_bytes(audio, SAMPLE_RATE)
+        url = self.settings.remote_url.rstrip("/") + "/audio/transcriptions"
+        try:
+            with self._infer_lock:  # final POST waits for any in-flight preview POST
+                body = _post_multipart_audio(url, wav, fields, timeout=60.0)
+            return (body.get("text") or "").strip()
+        except Exception as e:
+            log.error(f"Remote ASR failed ({self.settings.remote_url}): {e}")
+            return ""
+
     # ── AI cleaning ───────────────────────────────────────────────────────
     def clean_text(self, text):
+        # Raw mode: skip the LLM entirely and keep the exact transcribed words.
+        if self.settings.cleaning_preset == RAW_PRESET:
+            return CleanResult(text=text)
         try:
             provider = self._get_cleaning_provider()
             if provider is None:
@@ -704,12 +977,17 @@ class ZenVoxEngine:
 
     # ── VAD ────────────────────────────────────────────────────────────────
     def _check_vad(self, chunk):
+        chunk = np.asarray(chunk, dtype=np.float32).flatten()
         for off in range(0, len(chunk) - 511, 512):
-            w = chunk[off:off + 512]
-            frame = np.concatenate([self._vad_context, w]).reshape(1, -1).astype("float32")
+            w = chunk[off:off + 512].astype(np.float32)
+            frame = np.concatenate([self._vad_context, w]).reshape(1, -1).astype(np.float32)
             self._vad_context = w[-64:].copy()
-            probs, self._vad_h, self._vad_c = self._vad_model.session.run(
+            # ONNX is strict about dtype: any double slipping into input/h/c throws
+            # "Unexpected input data type", which silently kills speech detection.
+            probs, h, c = self._vad_model.session.run(
                 None, {"input": frame, "h": self._vad_h, "c": self._vad_c})
+            self._vad_h = np.asarray(h, dtype=np.float32)
+            self._vad_c = np.asarray(c, dtype=np.float32)
             p = float(probs[0])
             if p >= self.settings.vad_threshold:
                 self._speech_detected = True
@@ -718,12 +996,14 @@ class ZenVoxEngine:
                 if self._silence_start is None:
                     self._silence_start = time.time()
                 elif time.time() - self._silence_start >= self.settings.silence_timeout:
-                    if self._on_vad_stop:
-                        self._on_vad_stop()
+                    if self._vad_autostop:  # disabled in push-to-talk
+                        self._fire_stop()  # one-shot guarded — safe to reach repeatedly
                     return
 
     # ── Cleaning provider cache ──────────────────────────────────────────
     def _get_cleaning_provider(self):
+        if self.settings.cleaning_preset == RAW_PRESET:
+            return None  # Raw mode never cleans
         if self._cleaning_provider is None:
             try:
                 provider_name = self.settings.clean_provider
@@ -733,6 +1013,8 @@ class ZenVoxEngine:
                     return None
                 preset = CLEANING_PRESETS.get(
                     self.settings.cleaning_preset, CLEANING_PRESETS["General"])
+                # Dictionary Layer C: tell the LLM these spellings are intentional.
+                preset = preset + self.dictionary.prompt_block()
                 self._cleaning_provider = create_provider(
                     provider_name, api_key, self.settings.clean_model, preset,
                     endpoint=self.settings.ollama_endpoint if provider_name == "Ollama" else None,
@@ -862,7 +1144,7 @@ class FloatingOverlay:
         try:
             scale = self._win._get_widget_scaling()
         except Exception:
-            scale = 2.5
+            scale = detect_ui_scale()
         w, h = int(240 * scale), int(44 * scale)
         mon_w, mon_h, mon_x, mon_y = self._get_current_monitor()
         x = mon_x + (mon_w - w) // 2
@@ -928,6 +1210,8 @@ class ZenVoxApp:
         self._is_first_run = not SETTINGS_FILE.exists()
         self._state_lock = threading.Lock()
         self._state = AppState.LOADING
+        self._state_since = time.time()
+        self._stopping = False
         self._load_generation = 0
         self._pending_loads = 0
         self._last_clean_reason = ""
@@ -939,11 +1223,16 @@ class ZenVoxApp:
             max_workers=1, thread_name_prefix="zenvox-pipeline")
 
         ctk.set_appearance_mode("dark")
-        ctk.set_widget_scaling(2.5)
+        self._ui_scale = detect_ui_scale()
+        ctk.set_widget_scaling(self._ui_scale)
+        ctk.set_window_scaling(self._ui_scale)
         self.root = ctk.CTk()
         self.root.title("ZenVox - Voice to Text")
-        self.root.geometry("1800x1750")
-        self.root.resizable(False, False)
+        # Geometry is in LOGICAL pixels — customtkinter multiplies by the window
+        # scaling internally. Resizable now (was a fixed 1800x1750 HiDPI hack).
+        self.root.geometry("1100x740")
+        self.root.minsize(940, 620)
+        self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self._hide_window)
         self.root.bind("<Control-q>", lambda e: self._quit_from_ui())
         self.root.bind("<Escape>", lambda e: self._hide_window())
@@ -963,11 +1252,12 @@ class ZenVoxApp:
         self._overlay = FloatingOverlay(self.root)
         self._refresh_history()
 
-        if self._is_first_run:
-            # Show the settings window on first run so user can configure
+        if self._is_first_run or os.environ.get("ZENVOX_SHOW_WINDOW") == "1":
+            # Show the window on first run (to configure) or when explicitly asked.
             self.root.deiconify()
             self.root.lift()
-            self.settings.save()  # Create settings.json so next launch is normal
+            if self._is_first_run:
+                self.settings.save()  # Create settings.json so next launch is normal
         else:
             self.root.withdraw()
 
@@ -981,222 +1271,368 @@ class ZenVoxApp:
             threading.Thread(target=self.icon.run, daemon=True).start()
         else:
             self.icon.run_detached()
+        self.root.after(3000, self._watchdog_tick)
         self.root.mainloop()
 
-    # ── GUI Build ─────────────────────────────────────────────────────────
+    # ── GUI Build (sidebar shell + view router) ───────────────────────────
+    NAV_ITEMS = [
+        ("home", "Dictate"),
+        ("history", "History"),
+        ("dictionary", "Dictionary"),
+        ("settings", "Settings"),
+    ]
+
+    def _pal(self):
+        return (self.BG, self.PANEL, self.TEXT, self.MUTED,
+                self.TEAL, self.TEAL_H, self.BORDER)
+
     def _build_gui(self):
-        B, P, T, M, TL, TH, BD = (
-            self.BG, self.PANEL, self.TEXT, self.MUTED,
-            self.TEAL, self.TEAL_H, self.BORDER)
+        B, P, T, M, TL, TH, BD = self._pal()
         self.root.configure(fg_color=B)
-        main = ctk.CTkFrame(self.root, fg_color="transparent")
-        main.pack(fill="both", expand=True)
-
-        # ─── Status bar ───
         self.gui_status = ctk.StringVar(value="Loading...")
-        sf = ctk.CTkFrame(main, fg_color=P, border_color=BD, border_width=1, corner_radius=16)
-        sf.pack(fill="x", padx=24, pady=(16, 8))
-        si = ctk.CTkFrame(sf, fg_color="transparent")
-        si.pack(fill="x", padx=16, pady=12)
-        ctk.CTkLabel(si, text="Zen", font=("Inter Tight", 16, "bold"),
+        self._views = {}
+        self._nav_buttons = {}
+
+        self.root.grid_columnconfigure(1, weight=1)
+        self.root.grid_rowconfigure(0, weight=1)
+
+        # ─── Sidebar nav ───
+        sidebar = ctk.CTkFrame(self.root, fg_color=P, corner_radius=0, width=210)
+        sidebar.grid(row=0, column=0, sticky="nsw")
+        sidebar.grid_propagate(False)
+        self._build_sidebar(sidebar)
+
+        # ─── Content area ───
+        content = ctk.CTkFrame(self.root, fg_color=B, corner_radius=0)
+        content.grid(row=0, column=1, sticky="nsew")
+        content.grid_rowconfigure(1, weight=1)
+        content.grid_columnconfigure(0, weight=1)
+
+        header = ctk.CTkFrame(content, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=28, pady=(20, 6))
+        self._view_title = ctk.CTkLabel(header, text="Dictate",
+                                        font=("Inter Tight", 20, "bold"), text_color=T)
+        self._view_title.pack(side="left")
+        self._status_dot = ctk.CTkLabel(header, text="●", font=("Inter", 13),
+                                        text_color=self.MUTED, width=16)
+        self._status_dot.pack(side="right", padx=(8, 0))
+        ctk.CTkLabel(header, textvariable=self.gui_status, font=("Inter", 13),
+                     text_color="#a1a1aa").pack(side="right")
+
+        container = ctk.CTkFrame(content, fg_color="transparent")
+        container.grid(row=1, column=0, sticky="nsew", padx=28, pady=(0, 20))
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+        for name, _ in self.NAV_ITEMS:
+            frame = ctk.CTkFrame(container, fg_color="transparent")
+            frame.grid(row=0, column=0, sticky="nsew")
+            self._views[name] = frame
+
+        self._build_view_home(self._views["home"])
+        self._build_view_history(self._views["history"])
+        self._build_view_dictionary(self._views["dictionary"])
+        self._build_view_settings(self._views["settings"])
+        self._show_view("home")
+
+    def _build_sidebar(self, parent):
+        B, P, T, M, TL, TH, BD = self._pal()
+        wm = ctk.CTkFrame(parent, fg_color="transparent")
+        wm.pack(fill="x", padx=22, pady=(24, 22))
+        ctk.CTkLabel(wm, text="Zen", font=("Inter Tight", 22, "bold"),
                      text_color=T).pack(side="left")
-        ctk.CTkLabel(si, text="Vox", font=("Inter Tight", 16, "bold"),
+        ctk.CTkLabel(wm, text="Vox", font=("Inter Tight", 22, "bold"),
                      text_color=TL).pack(side="left")
-        ctk.CTkLabel(si, text="  Voice to Text", font=("Inter Tight", 14),
-                     text_color=M).pack(side="left")
-        if not self._tray_has_menu:
-            action_frame = ctk.CTkFrame(si, fg_color="transparent")
-            action_frame.pack(side="right")
-            ctk.CTkButton(
-                action_frame, text="Hide", command=self._hide_window,
-                fg_color=BD, hover_color="#333333", text_color=T,
-                font=("Inter Tight", 12, "bold"), corner_radius=8, width=78, height=30
-            ).pack(side="right", padx=(8, 0))
-            ctk.CTkButton(
-                action_frame, text="Quit", command=self._quit_from_ui,
-                fg_color="#7f1d1d", hover_color="#991b1b", text_color="#ffffff",
-                font=("Inter Tight", 12, "bold"), corner_radius=8, width=78, height=30
-            ).pack(side="right")
-        ctk.CTkLabel(si, textvariable=self.gui_status, font=("Inter", 13),
-                     text_color="#a1a1aa").pack(side="right", padx=(0, 12 if not self._tray_has_menu else 0))
+        for name, label in self.NAV_ITEMS:
+            btn = ctk.CTkButton(
+                parent, text=label, anchor="w", fg_color="transparent",
+                hover_color=BD, text_color=M, font=("Inter Tight", 15),
+                corner_radius=10, height=42, command=lambda n=name: self._show_view(n))
+            btn.pack(fill="x", padx=12, pady=2)
+            self._nav_buttons[name] = btn
+        ctk.CTkFrame(parent, fg_color="transparent").pack(fill="both", expand=True)
+        ctk.CTkButton(parent, text="Hide to tray", command=self._hide_window,
+                      fg_color=BD, hover_color="#333333", text_color=T,
+                      font=("Inter Tight", 12), corner_radius=8, height=34
+                      ).pack(fill="x", padx=12, pady=(0, 6))
+        ctk.CTkButton(parent, text="Quit", command=self._quit_from_ui,
+                      fg_color="#7f1d1d", hover_color="#991b1b", text_color="#ffffff",
+                      font=("Inter Tight", 12), corner_radius=8, height=34
+                      ).pack(fill="x", padx=12, pady=(0, 16))
 
-        # ─── Tabs ───
-        tabs = ctk.CTkTabview(
-            main, fg_color=P, border_color=BD, border_width=1, corner_radius=16,
-            segmented_button_fg_color=B,
-            segmented_button_selected_color=TL,
-            segmented_button_selected_hover_color=TH,
-            segmented_button_unselected_color=BD,
-            segmented_button_unselected_hover_color="#333")
-        tabs.pack(fill="both", expand=True, padx=24, pady=(0, 8))
-        t_tab = tabs.add("Transcribe")
-        h_tab = tabs.add("History")
-        tabs.set("Transcribe")
+    def _show_view(self, name):
+        view = self._views.get(name)
+        if view is None:
+            return
+        view.tkraise()
+        self._view_title.configure(text=dict(self.NAV_ITEMS).get(name, name))
+        for n, btn in self._nav_buttons.items():
+            active = (n == name)
+            btn.configure(text_color=self.TEAL if active else self.MUTED,
+                          fg_color=self.BORDER if active else "transparent")
+        if name == "dictionary":
+            self._refresh_dictionary()
+        elif name == "history":
+            self._refresh_history()
 
-        # -- Transcribe tab --
-        ctk.CTkLabel(t_tab, text="Last transcription",
-                     font=("Inter", 13, "bold"), text_color=M
-                     ).pack(anchor="w", padx=8, pady=(8, 4))
-        self.gui_text = ctk.CTkTextbox(
-            t_tab, wrap="word", state="disabled",
-            fg_color="transparent", text_color=T, font=("Inter", 14))
-        self.gui_text.pack(fill="both", expand=True, padx=4, pady=4)
-        bf = ctk.CTkFrame(t_tab, fg_color="transparent")
-        bf.pack(fill="x", padx=8, pady=(4, 8))
+    # ── View: Dictate (home) ──────────────────────────────────────────────
+    def _build_view_home(self, parent):
+        B, P, T, M, TL, TH, BD = self._pal()
+        card = ctk.CTkFrame(parent, fg_color=P, border_color=BD, border_width=1,
+                            corner_radius=16)
+        card.pack(fill="x", pady=(0, 14))
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=22, pady=18)
+        self._rec_btn = ctk.CTkButton(
+            inner, text="●", width=56, height=56, corner_radius=28,
+            fg_color="#ef5350", hover_color="#c62828", text_color="#fff",
+            font=("Inter", 26), command=self._gui_toggle_record)
+        self._rec_btn.pack(side="left", padx=(0, 18))
+        meta = ctk.CTkFrame(inner, fg_color="transparent")
+        meta.pack(side="left", fill="x", expand=True)
+        self._timer_label = ctk.CTkLabel(meta, text="Ready", anchor="w",
+                                         font=("Inter Tight", 15, "bold"), text_color=M)
+        self._timer_label.pack(fill="x")
+        self._level_bar = ctk.CTkProgressBar(meta, progress_color="#ef5350",
+                                            fg_color=B, height=8, corner_radius=4)
+        self._level_bar.pack(fill="x", pady=(8, 0))
+        self._level_bar.set(0)
+        hk = self.settings.hotkey_record.lower()
+        ctk.CTkLabel(meta, text=f"Press  {hk}  to dictate into any app",
+                     font=("Inter", 11), text_color=M, anchor="w").pack(fill="x", pady=(6, 0))
+
+        ctk.CTkLabel(parent, text="Last transcription", font=("Inter", 13, "bold"),
+                     text_color=M).pack(anchor="w", pady=(4, 4))
+        self.gui_text = ctk.CTkTextbox(parent, wrap="word", state="disabled",
+                                       fg_color=P, text_color=T, font=("Inter", 14),
+                                       border_color=BD, border_width=1, corner_radius=12)
+        self.gui_text.pack(fill="both", expand=True)
+        bf = ctk.CTkFrame(parent, fg_color="transparent")
+        bf.pack(fill="x", pady=(10, 0))
         ctk.CTkButton(bf, text="Re-paste", command=self._gui_repaste,
                       fg_color=BD, hover_color=TL, text_color=T,
                       font=("Inter Tight", 13, "bold"), corner_radius=8,
-                      width=100, height=36).pack(side="right", padx=(8, 0))
+                      width=110, height=38).pack(side="right", padx=(8, 0))
         ctk.CTkButton(bf, text="Copy", command=self._gui_copy,
                       fg_color=TL, hover_color=TH, text_color=B,
                       font=("Inter Tight", 13, "bold"), corner_radius=8,
-                      width=100, height=36).pack(side="right")
+                      width=110, height=38).pack(side="right")
 
-        # -- History tab --
+    # ── View: History ─────────────────────────────────────────────────────
+    def _build_view_history(self, parent):
+        B, P, T, M, TL, TH, BD = self._pal()
         self._search_var = ctk.StringVar()
-        se = ctk.CTkEntry(h_tab, textvariable=self._search_var,
-                          placeholder_text="Search history...",
-                          fg_color=B, border_color=BD, text_color=T, font=("Inter", 12))
-        se.pack(fill="x", padx=8, pady=(12, 8))
+        se = ctk.CTkEntry(parent, textvariable=self._search_var,
+                          placeholder_text="Search history...", height=38,
+                          fg_color=P, border_color=BD, text_color=T, font=("Inter", 13))
+        se.pack(fill="x", pady=(0, 10))
         self._search_var.trace_add("write", lambda *a: self._refresh_history())
-        self._hist_frame = ctk.CTkScrollableFrame(h_tab, fg_color="transparent")
-        self._hist_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
-        hbf = ctk.CTkFrame(h_tab, fg_color="transparent")
-        hbf.pack(fill="x", padx=8, pady=(4, 8))
-        ctk.CTkButton(hbf, text="Clear History", fg_color=BD,
-                      hover_color="#ef5350", text_color=T, font=("Inter", 12),
-                      corner_radius=8, width=110, height=30,
-                      command=self._gui_clear_history).pack(side="right")
+        self._hist_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        self._hist_frame.pack(fill="both", expand=True)
+        hbf = ctk.CTkFrame(parent, fg_color="transparent")
+        hbf.pack(fill="x", pady=(10, 0))
+        ctk.CTkButton(hbf, text="Clear History", fg_color=BD, hover_color="#ef5350",
+                      text_color=T, font=("Inter", 12), corner_radius=8,
+                      width=120, height=32, command=self._gui_clear_history).pack(side="right")
 
-        # ─── Recording bar ───
-        rf = ctk.CTkFrame(main, fg_color=P, border_color=BD, border_width=1,
-                          corner_radius=12)
-        rf.pack(fill="x", padx=24, pady=(0, 8))
-        ri = ctk.CTkFrame(rf, fg_color="transparent")
-        ri.pack(fill="x", padx=16, pady=10)
-        # Record button — prominent, unmistakable primary action
-        self._rec_btn = ctk.CTkButton(
-            ri, text="\u25cf", width=40, height=40, corner_radius=20,
-            fg_color="#ef5350", hover_color="#c62828", text_color="#fff",
-            font=("Inter", 20), command=self._gui_toggle_record)
-        self._rec_btn.pack(side="left", padx=(0, 12))
-        self._level_bar = ctk.CTkProgressBar(
-            ri, progress_color="#ef5350", fg_color=B,
-            height=8, width=180, corner_radius=4)
-        self._level_bar.pack(side="left", padx=(0, 12))
-        self._level_bar.set(0)
-        self._timer_label = ctk.CTkLabel(ri, text="Ready",
-                                         font=("Inter", 12), text_color=M)
-        self._timer_label.pack(side="left")
+    # ── View: Dictionary ──────────────────────────────────────────────────
+    def _build_view_dictionary(self, parent):
+        B, P, T, M, TL, TH, BD = self._pal()
+        ctk.CTkLabel(parent, anchor="w", font=("Inter", 12), text_color=M,
+                     text="Add words, names, and jargon so they come out spelled exactly right — every time."
+                     ).pack(fill="x", pady=(0, 10))
+        addcard = ctk.CTkFrame(parent, fg_color=P, border_color=BD, border_width=1,
+                              corner_radius=12)
+        addcard.pack(fill="x", pady=(0, 12))
+        row = ctk.CTkFrame(addcard, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=12)
+        self._dict_written = ctk.CTkEntry(row, placeholder_text="Written (e.g. ZenVox)",
+                                          width=190, fg_color=B, border_color=BD,
+                                          text_color=T, font=("Inter", 12))
+        self._dict_written.pack(side="left", padx=(0, 8))
+        self._dict_spoken = ctk.CTkEntry(row, placeholder_text="Sounds like (comma-separated, optional)",
+                                         fg_color=B, border_color=BD, text_color=T, font=("Inter", 12))
+        self._dict_spoken.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._dict_boost = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(row, variable=self._dict_boost, text="Boost only",
+                        fg_color=TL, hover_color=TH, text_color=M, font=("Inter", 11),
+                        checkbox_width=18, checkbox_height=18).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(row, text="Add", command=self._dict_add, fg_color=TL,
+                      hover_color=TH, text_color=B, font=("Inter Tight", 12, "bold"),
+                      corner_radius=8, width=70, height=32).pack(side="left")
+        self._dict_written.bind("<Return>", lambda e: self._dict_add())
+        self._dict_spoken.bind("<Return>", lambda e: self._dict_add())
+        self._dict_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        self._dict_frame.pack(fill="both", expand=True)
 
-        # ─── Settings ───
-        sp = ctk.CTkFrame(main, fg_color=P, corner_radius=16,
-                          border_color=BD, border_width=1)
-        sp.pack(fill="x", padx=24, pady=(0, 8))
+    def _refresh_dictionary(self):
+        if not hasattr(self, "_dict_frame"):
+            return
+        B, P, T, M, TL, TH, BD = self._pal()
+        for w in self._dict_frame.winfo_children():
+            w.destroy()
+        entries = sorted(self.engine.dictionary.entries, key=lambda e: e.written.lower())
+        if not entries:
+            ctk.CTkLabel(self._dict_frame, font=("Inter", 12), text_color=M,
+                         text="No words yet. Add names or jargon above.").pack(anchor="w", padx=8, pady=12)
+            return
+        for e in entries:
+            f = ctk.CTkFrame(self._dict_frame, fg_color=P, corner_radius=8)
+            f.pack(fill="x", pady=3)
+            inner = ctk.CTkFrame(f, fg_color="transparent")
+            inner.pack(fill="x", padx=12, pady=8)
+            ctk.CTkLabel(inner, text=e.written, font=("Inter Tight", 13, "bold"),
+                         text_color=TL).pack(side="left")
+            if e.boost_only:
+                ctk.CTkLabel(inner, text="  boost", font=("Inter", 10),
+                             text_color=M).pack(side="left")
+            if e.spoken:
+                ctk.CTkLabel(inner, text="  ← " + ", ".join(e.spoken),
+                             font=("Inter", 11), text_color=M, anchor="w"
+                             ).pack(side="left", fill="x", expand=True)
+            ctk.CTkButton(inner, text="✕", width=28, height=24, fg_color=BD,
+                          hover_color="#ef5350", text_color=T, font=("Inter", 12),
+                          corner_radius=6,
+                          command=lambda w=e.written: self._dict_delete(w)).pack(side="right")
 
-        # Row 1: Model, Language, Mic
-        r1 = ctk.CTkFrame(sp, fg_color="transparent")
-        r1.pack(fill="x", padx=20, pady=(12, 8))
+    def _dict_add(self):
+        written = self._dict_written.get().strip()
+        if not written:
+            return
+        spoken = [s.strip() for s in self._dict_spoken.get().split(",") if s.strip()]
+        self.engine.dictionary.add(DictionaryEntry(
+            written=written, spoken=spoken, boost_only=bool(self._dict_boost.get())))
+        self.engine.invalidate_provider()  # Layer C must pick up new vocab
+        self._dict_written.delete(0, "end")
+        self._dict_spoken.delete(0, "end")
+        self._dict_boost.set(False)
+        self._refresh_dictionary()
+
+    def _dict_delete(self, written):
+        self.engine.dictionary.delete(written)
+        self.engine.invalidate_provider()
+        self._refresh_dictionary()
+
+    # ── View: Settings ────────────────────────────────────────────────────
+    def _build_view_settings(self, parent):
+        B, P, T, M, TL, TH, BD = self._pal()
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        combo = dict(fg_color=B, border_color=BD, button_color=BD, button_hover_color=TL,
+                     dropdown_fg_color=P, dropdown_hover_color=TL, font=("Inter", 12), text_color=T)
+        entry = dict(fg_color=B, border_color=BD, text_color=T, font=("Inter", 12))
+
+        def section(title):
+            ctk.CTkLabel(scroll, text=title, font=("Inter Tight", 14, "bold"),
+                         text_color=T, anchor="w").pack(fill="x", pady=(14, 6))
+            card = ctk.CTkFrame(scroll, fg_color=P, border_color=BD, border_width=1, corner_radius=12)
+            card.pack(fill="x")
+            return card
+
+        # Transcription
+        c = section("Transcription")
+        r = ctk.CTkFrame(c, fg_color="transparent")
+        r.pack(fill="x", padx=16, pady=14)
         self.gui_model = ctk.StringVar(value=self.settings.model_name)
-        ctk.CTkComboBox(
-            r1, variable=self.gui_model, values=MODELS, width=155,
-            fg_color=B, border_color=BD, button_color=BD, button_hover_color=TL,
-            dropdown_fg_color=P, dropdown_hover_color=TL,
-            font=("Inter", 12), text_color=T,
-            command=self._on_model).pack(side="left", padx=(0, 8))
+        ctk.CTkComboBox(r, variable=self.gui_model, values=MODELS, width=180,
+                        command=self._on_model, **combo).pack(side="left", padx=(0, 8))
         self.gui_lang = ctk.StringVar(value=self.settings.lang_name)
-        ctk.CTkComboBox(
-            r1, variable=self.gui_lang, values=list(LANGS.keys()), width=130,
-            fg_color=B, border_color=BD, button_color=BD, button_hover_color=TL,
-            dropdown_fg_color=P, dropdown_hover_color=TL,
-            font=("Inter", 12), text_color=T,
-            command=self._on_lang).pack(side="left", padx=(0, 8))
+        ctk.CTkComboBox(r, variable=self.gui_lang, values=list(LANGS.keys()), width=150,
+                        command=self._on_lang, **combo).pack(side="left", padx=(0, 8))
         self.gui_mic = ctk.StringVar(value=self.settings.mic_name)
-        ctk.CTkComboBox(
-            r1, variable=self.gui_mic, values=[n for _, n in self.input_devs],
-            fg_color=B, border_color=BD, button_color=BD, button_hover_color=TL,
-            dropdown_fg_color=P, dropdown_hover_color=TL,
-            font=("Inter", 12), text_color=T,
-            command=self._on_mic).pack(side="left", fill="x", expand=True)
+        ctk.CTkComboBox(r, variable=self.gui_mic, values=[n for _, n in self.input_devs],
+                        command=self._on_mic, **combo).pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(c, anchor="w", font=("Inter", 11), text_color=M,
+                     text="Tip: keep Language on Auto-detect for franglais — forcing French mistranscribes English."
+                     ).pack(fill="x", padx=16, pady=(0, 8))
+        rb = ctk.CTkFrame(c, fg_color="transparent")
+        rb.pack(fill="x", padx=16, pady=(0, 14))
+        ctk.CTkLabel(rb, text="Run on:", font=("Inter", 12), text_color=M).pack(side="left", padx=(0, 4))
+        self._backend_labels = {BACKEND_LOCAL: "This machine (local GPU/CPU)",
+                                BACKEND_REMOTE: "Remote server (P620)"}
+        self.gui_backend = ctk.StringVar(
+            value=self._backend_labels.get(self.settings.transcription_backend, self._backend_labels[BACKEND_LOCAL]))
+        ctk.CTkComboBox(rb, variable=self.gui_backend, values=list(self._backend_labels.values()),
+                        width=230, command=self._on_backend, **combo).pack(side="left", padx=(0, 8))
+        self.gui_remote_url = ctk.StringVar(value=self.settings.remote_url)
+        rue = ctk.CTkEntry(rb, textvariable=self.gui_remote_url, placeholder_text="http://host:8771/v1", **entry)
+        rue.pack(side="left", fill="x", expand=True)
+        rue.bind("<FocusOut>", lambda e: self._on_remote_url())
 
-        # Row 2: Provider + API key + Model
-        r2 = ctk.CTkFrame(sp, fg_color="transparent")
-        r2.pack(fill="x", padx=20, pady=(0, 8))
-        ctk.CTkLabel(r2, text="AI:", font=("Inter", 12, "bold"),
-                     text_color=M, width=25).pack(side="left", padx=(0, 4))
+        # AI Cleaning — provider + key + model MUST share one frame
+        # (_sync_provider_inputs re-packs the key entry with before=self._model_entry).
+        c = section("AI Cleaning")
+        r = ctk.CTkFrame(c, fg_color="transparent")
+        r.pack(fill="x", padx=16, pady=14)
         self.gui_provider = ctk.StringVar(value=self.settings.clean_provider)
-        ctk.CTkComboBox(
-            r2, variable=self.gui_provider, values=PROVIDER_NAMES, width=105,
-            fg_color=B, border_color=BD, button_color=BD, button_hover_color=TL,
-            dropdown_fg_color=P, dropdown_hover_color=TL,
-            font=("Inter", 12), text_color=T,
-            command=self._on_provider).pack(side="left", padx=(0, 8))
+        ctk.CTkComboBox(r, variable=self.gui_provider, values=PROVIDER_NAMES, width=120,
+                        command=self._on_provider, **combo).pack(side="left", padx=(0, 8))
         self.gui_key = ctk.StringVar(value=self.settings.get_api_key())
-        self._key_entry = ctk.CTkEntry(r2, textvariable=self.gui_key, show="*",
-                          placeholder_text="API key", width=200,
-                          fg_color=B, border_color=BD, text_color=T, font=("Inter", 12))
+        self._key_entry = ctk.CTkEntry(r, textvariable=self.gui_key, show="*",
+                                       placeholder_text="API key", width=220, **entry)
         self._key_entry.pack(side="left", padx=(0, 8))
         self._key_entry.bind("<FocusOut>", lambda e: self._on_key())
         self.gui_clean = ctk.StringVar(value=self.settings.clean_model)
-        ce = ctk.CTkEntry(r2, textvariable=self.gui_clean,
+        ce = ctk.CTkEntry(r, textvariable=self.gui_clean,
                           placeholder_text=PROVIDERS.get(self.settings.clean_provider, {}).get("default_model", ""),
-                          width=180, fg_color=B, border_color=BD, text_color=T, font=("Inter", 12))
+                          **entry)
         ce.pack(side="left", fill="x", expand=True)
         ce.bind("<FocusOut>", lambda e: self._on_clean())
         self._model_entry = ce
+        r2 = ctk.CTkFrame(c, fg_color="transparent")
+        r2.pack(fill="x", padx=16, pady=(0, 14))
+        ctk.CTkLabel(r2, text="Cleaning style:", font=("Inter", 12),
+                     text_color=M).pack(side="left", padx=(0, 8))
+        self.gui_preset = ctk.StringVar(value=self.settings.cleaning_preset)
+        ctk.CTkComboBox(r2, variable=self.gui_preset, values=PRESET_NAMES,
+                        width=150, command=self._on_preset, **combo).pack(side="left")
+        ctk.CTkLabel(r2, text="(Raw = no AI cleanup, exact words)", font=("Inter", 11),
+                     text_color=M).pack(side="left", padx=(10, 0))
 
-        # Row 3: Silence, Output, Cleaning preset
-        r3 = ctk.CTkFrame(sp, fg_color="transparent")
-        r3.pack(fill="x", padx=20, pady=(0, 12))
-        ctk.CTkLabel(r3, text="Silence:", font=("Inter", 12),
+        # Behavior
+        c = section("Behavior")
+        r = ctk.CTkFrame(c, fg_color="transparent")
+        r.pack(fill="x", padx=16, pady=14)
+        ctk.CTkLabel(r, text="Silence stop:", font=("Inter", 12),
                      text_color=M).pack(side="left", padx=(0, 4))
         self.gui_silence = ctk.StringVar(value=str(self.settings.silence_timeout))
-        sle = ctk.CTkEntry(r3, textvariable=self.gui_silence, width=50,
-                           fg_color=B, border_color=BD, text_color=T, font=("Inter", 12))
+        sle = ctk.CTkEntry(r, textvariable=self.gui_silence, width=56, **entry)
         sle.pack(side="left")
         sle.bind("<FocusOut>", lambda e: self._on_silence())
-        ctk.CTkLabel(r3, text="s", font=("Inter", 11),
-                     text_color=M).pack(side="left", padx=(2, 12))
-        ctk.CTkLabel(r3, text="Output:", font=("Inter", 12),
-                     text_color=M).pack(side="left", padx=(0, 4))
+        ctk.CTkLabel(r, text="s", font=("Inter", 11), text_color=M).pack(side="left", padx=(2, 16))
+        ctk.CTkLabel(r, text="Output:", font=("Inter", 12), text_color=M).pack(side="left", padx=(0, 4))
         self.gui_output = ctk.StringVar(value=self.settings.output_mode)
-        ctk.CTkComboBox(
-            r3, variable=self.gui_output, values=OUTPUT_MODES, width=135,
-            fg_color=B, border_color=BD, button_color=BD, button_hover_color=TL,
-            dropdown_fg_color=P, dropdown_hover_color=TL,
-            font=("Inter", 12), text_color=T,
-            command=self._on_output).pack(side="left", padx=(0, 12))
-        ctk.CTkLabel(r3, text="Cleaning:", font=("Inter", 12),
-                     text_color=M).pack(side="left", padx=(0, 4))
-        self.gui_preset = ctk.StringVar(value=self.settings.cleaning_preset)
-        ctk.CTkComboBox(
-            r3, variable=self.gui_preset, values=list(CLEANING_PRESETS.keys()),
-            width=120, fg_color=B, border_color=BD, button_color=BD,
-            button_hover_color=TL, dropdown_fg_color=P, dropdown_hover_color=TL,
-            font=("Inter", 12), text_color=T,
-            command=self._on_preset).pack(side="left")
+        ctk.CTkComboBox(r, variable=self.gui_output, values=OUTPUT_MODES, width=150,
+                        command=self._on_output, **combo).pack(side="left", padx=(0, 16))
         self.gui_audio = ctk.BooleanVar(value=self.settings.audio_feedback)
-        ctk.CTkCheckBox(r3, variable=self.gui_audio, text="Sound",
-                        fg_color=TL, hover_color=TH, text_color=M,
-                        font=("Inter", 12), width=20, checkbox_width=18,
-                        checkbox_height=18, command=self._on_audio
-                        ).pack(side="right", padx=(8, 0))
+        ctk.CTkCheckBox(r, variable=self.gui_audio, text="Sound", fg_color=TL,
+                        hover_color=TH, text_color=M, font=("Inter", 12), checkbox_width=18,
+                        checkbox_height=18, command=self._on_audio).pack(side="left")
+        rb = ctk.CTkFrame(c, fg_color="transparent")
+        rb.pack(fill="x", padx=16, pady=(0, 14))
+        ctk.CTkLabel(rb, text="Capture:", font=("Inter", 12), text_color=M).pack(side="left", padx=(0, 4))
+        self._capture_labels = {CAPTURE_TOGGLE: "Toggle — press to start, auto-stop on silence",
+                                CAPTURE_PTT: "Push-to-talk — hold the record key"}
+        self.gui_capture = ctk.StringVar(
+            value=self._capture_labels.get(self.settings.capture_mode, self._capture_labels[CAPTURE_TOGGLE]))
+        ctk.CTkComboBox(rb, variable=self.gui_capture, values=list(self._capture_labels.values()),
+                        width=320, command=self._on_capture_mode, **combo).pack(side="left")
+        self.gui_preview = ctk.BooleanVar(value=self.settings.live_preview)
+        ctk.CTkCheckBox(rb, variable=self.gui_preview, text="Live preview", fg_color=TL,
+                        hover_color=TH, text_color=M, font=("Inter", 12), checkbox_width=18,
+                        checkbox_height=18, command=self._on_preview).pack(side="left", padx=(16, 0))
 
-        # ─── Footer ───
-        ff = ctk.CTkFrame(main, fg_color="transparent")
-        ff.pack(fill="x", padx=32, pady=(0, 12))
-        hk_rec = self.settings.hotkey_record.lower()
-        hk_rep = self.settings.hotkey_repaste.lower()
-        ctk.CTkLabel(ff, text=f"{hk_rec} = record  \u00b7  {hk_rep} = re-paste",
-                     font=("Inter", 12), text_color="#a1a1aa").pack(side="left")
+        # Hotkeys
+        c = section("Hotkeys")
+        hk = ctk.CTkFrame(c, fg_color="transparent")
+        hk.pack(fill="x", padx=16, pady=14)
+        ctk.CTkLabel(hk, anchor="w", font=("Inter", 12), text_color=T,
+                     text=f"{self.settings.hotkey_record.lower()}   →   record / stop").pack(fill="x")
+        ctk.CTkLabel(hk, anchor="w", font=("Inter", 12), text_color=T,
+                     text=f"{self.settings.hotkey_repaste.lower()}   →   re-paste last").pack(fill="x", pady=(4, 0))
         if not self._tray_has_menu:
-            ctk.CTkLabel(
-                ff,
-                text=("Tray menus are unavailable on this backend. "
-                      "Left-click the tray icon to reopen. Ctrl+Q quits."),
-                font=("Inter", 11),
-                text_color=self.MUTED,
-            ).pack(side="left", padx=(16, 0))
+            ctk.CTkLabel(c, anchor="w", font=("Inter", 11), text_color=M,
+                         text="Tray menus are unavailable on this backend — use this window; Ctrl+Q quits."
+                         ).pack(fill="x", padx=16, pady=(0, 12))
 
     # ── GUI Callbacks ─────────────────────────────────────────────────────
     def _gui_toggle_record(self):
@@ -1216,6 +1652,12 @@ class ZenVoxApp:
         self.gui_text.delete("1.0", "end")
         self.gui_text.insert("end", text)
         self.gui_text.configure(state="disabled")
+
+    def _on_partial_preview(self, text):
+        # Live preview while still recording — show partial text + a cue.
+        if self._get_state() == AppState.RECORDING and text:
+            self._gui_update_text(text + " …")
+            self._overlay.set_label("Listening…")
 
     def _gui_clear_history(self):
         self.history.clear()
@@ -1267,10 +1709,12 @@ class ZenVoxApp:
 
     def _set_app_state(self, state, tooltip=None):
         with self._state_lock:
+            if state != self._state:
+                self._state_since = time.time()
             self._state = state
         msg = tooltip or {
             AppState.LOADING: "Loading model...",
-            AppState.IDLE: f"Ready [{DEVICE_LABEL}]",
+            AppState.IDLE: f"Ready [{self.engine.active_device_label}]",
             AppState.RECORDING: "Recording...",
             AppState.TRANSCRIBING: "Transcribing...",
             AppState.CLEANING: "Cleaning...",
@@ -1284,6 +1728,37 @@ class ZenVoxApp:
             self.icon.title = f"ZenVox - {msg}"
         self._queue_ui(lambda msg=msg: self.gui_status.set(msg))
         self._queue_ui(self._update_rec_bar)
+
+    # ── Watchdog ──────────────────────────────────────────────────────────
+    def _watchdog_tick(self):
+        """Periodic self-heal: un-stick the app if a state wedged. Runs on Tk."""
+        try:
+            self._check_stuck_state()
+        except Exception:
+            log.exception("Watchdog error")
+        finally:
+            try:
+                self.root.after(3000, self._watchdog_tick)
+            except RuntimeError:
+                pass
+
+    def _check_stuck_state(self):
+        state = self._get_state()
+        with self._state_lock:
+            elapsed = time.time() - self._state_since
+        if (state in (AppState.TRANSCRIBING, AppState.CLEANING)
+                and elapsed > STUCK_PIPELINE_TIMEOUT):
+            log.error(f"Watchdog: stuck in {state.value} for {elapsed:.0f}s — forcing reset")
+            self.engine.force_reset()
+            self._set_app_state(AppState.IDLE, f"Ready [{self.engine.active_device_label}] - recovered from stall")
+            self._overlay.hide()
+            self._update_rec_bar()
+        elif (state == AppState.RECORDING and not self.engine.is_recording
+                and not self._stopping and elapsed > 2.0):
+            log.warning("Watchdog: state is RECORDING but engine is idle — resetting")
+            self._set_app_state(AppState.IDLE, f"Ready [{self.engine.active_device_label}]")
+            self._overlay.hide()
+            self._update_rec_bar()
 
     def _pipeline_active(self):
         return self.engine.is_busy or self._get_state() in (AppState.TRANSCRIBING, AppState.CLEANING)
@@ -1350,7 +1825,7 @@ class ZenVoxApp:
             self._set_app_state(AppState.LOADING, f"Loading {self.settings.model_name}...")
             return
 
-        self._set_app_state(AppState.IDLE, f"Ready [{DEVICE_LABEL}]")
+        self._set_app_state(AppState.IDLE, f"Ready [{self.engine.active_device_label}]")
 
     # ── Settings Callbacks ────────────────────────────────────────────────
     def _on_model(self, v=None):
@@ -1467,6 +1942,39 @@ class ZenVoxApp:
     def _on_audio(self):
         self.settings.audio_feedback = self.gui_audio.get()
         self.settings.save()
+
+    def _on_capture_mode(self, v=None):
+        label = self.gui_capture.get()
+        mode = next((k for k, lbl in self._capture_labels.items() if lbl == label), CAPTURE_TOGGLE)
+        self.settings.capture_mode = mode
+        self.settings.save()
+        log.info(f"Capture mode -> {mode}")
+
+    def _on_preview(self):
+        self.settings.live_preview = bool(self.gui_preview.get())
+        self.settings.save()
+
+    def _on_backend(self, v=None):
+        if not self._guard_setting_change(
+                "backend", revert=lambda: self.gui_backend.set(
+                    self._backend_labels.get(self.settings.transcription_backend, ""))):
+            return
+        label = self.gui_backend.get()
+        backend = next((k for k, lbl in self._backend_labels.items() if lbl == label), BACKEND_LOCAL)
+        if backend == self.settings.transcription_backend:
+            return
+        self.settings.transcription_backend = backend
+        self.settings.save()
+        log.info(f"Transcription backend -> {backend}")
+        # Reload: remote unloads the local Whisper model, local loads it back.
+        self._schedule_model_load(self.settings.model_name)
+
+    def _on_remote_url(self):
+        url = self.gui_remote_url.get().strip()
+        if url and url != self.settings.remote_url:
+            self.settings.remote_url = url
+            self.settings.save()
+            log.info(f"Remote ASR URL -> {url}")
 
     def _sync_provider_inputs(self):
         provider = self.settings.clean_provider
@@ -1681,22 +2189,89 @@ class ZenVoxApp:
         rec_combo = self._parse_hotkey_pynput(self.settings.hotkey_record)
         rep_combo = self._parse_hotkey_pynput(self.settings.hotkey_repaste)
         current_keys = set()
+        ptt = {"timer": None}
+        PTT_GRACE = 0.18  # window to absorb X11 auto-repeat (press/release bursts)
+
+        def cancel_timer():
+            t = ptt["timer"]
+            if t is not None:
+                t.cancel()
+                ptt["timer"] = None
+
+        def ptt_stop():
+            ptt["timer"] = None
+            if self.engine.is_recording:
+                self.root.after(0, self._stop_and_transcribe)
 
         def on_press(key):
-            current_keys.add(key)
-            if rec_combo and rec_combo.issubset(current_keys):
-                current_keys.clear()
-                self._toggle()
-            elif rep_combo and rep_combo.issubset(current_keys):
-                current_keys.clear()
-                self._repaste()
+            # Runs on pynput's listener thread. An uncaught exception here KILLS
+            # the listener — the tray stays up but the record hotkey goes dead.
+            # So: never do real work here, never raise. Work runs on its own
+            # short-lived thread (off both the listener and the Tk main loop).
+            try:
+                current_keys.add(key)
+                if rec_combo and rec_combo.issubset(current_keys):
+                    if self.settings.capture_mode == CAPTURE_PTT:
+                        # A press during the grace window is auto-repeat, not a
+                        # real re-press — cancel any pending stop and keep going.
+                        cancel_timer()
+                        threading.Thread(target=self._safe_start_ptt, daemon=True).start()
+                    else:
+                        current_keys.clear()
+                        threading.Thread(target=self._safe_toggle, daemon=True).start()
+                elif rep_combo and rep_combo.issubset(current_keys):
+                    current_keys.clear()
+                    threading.Thread(target=self._repaste, daemon=True).start()
+            except Exception:
+                log.exception("Hotkey on_press error (ignored to keep listener alive)")
 
         def on_release(key):
-            current_keys.discard(key)
+            try:
+                was_rec_key = key in rec_combo
+                current_keys.discard(key)
+                if (self.settings.capture_mode == CAPTURE_PTT and was_rec_key
+                        and self.engine.is_recording):
+                    # Defer the stop briefly: X11 auto-repeat fires release+press
+                    # rapidly while held, so only stop if no re-press follows.
+                    cancel_timer()
+                    t = threading.Timer(PTT_GRACE, ptt_stop)
+                    t.daemon = True
+                    ptt["timer"] = t
+                    t.start()
+            except Exception:
+                log.exception("Hotkey on_release error (ignored)")
 
-        log.info(f"Hotkeys: {self.settings.hotkey_record}=record, {self.settings.hotkey_repaste}=re-paste")
+        log.info(f"Hotkeys: {self.settings.hotkey_record}=record ({self.settings.capture_mode}), "
+                 f"{self.settings.hotkey_repaste}=re-paste")
         with Listener(on_press=on_press, on_release=on_release) as listener:
             listener.join()
+
+    def _safe_toggle(self):
+        """Toggle wrapper for the hotkey thread — never lets a failure escape."""
+        try:
+            self._toggle()
+        except Exception:
+            log.exception("Toggle failed — recovering to IDLE")
+            self.engine.force_reset()
+            self._set_app_state(AppState.IDLE, f"Ready [{self.engine.active_device_label}] - recovered")
+            self.root.after(0, self._overlay.hide)
+            self.root.after(0, self._update_rec_bar)
+
+    def _safe_start_ptt(self):
+        """Push-to-talk start (record key pressed/held). Begins recording if idle."""
+        try:
+            state = self._get_state()
+            if state in (AppState.LOADING, AppState.TRANSCRIBING, AppState.CLEANING, AppState.ERROR):
+                return
+            if self.engine.is_recording or not self.engine.is_ready:
+                return
+            self._start_recording()
+        except Exception:
+            log.exception("PTT start failed — recovering")
+            self.engine.force_reset()
+            self._set_app_state(AppState.IDLE, f"Ready [{self.engine.active_device_label}] - recovered")
+            self.root.after(0, self._overlay.hide)
+            self.root.after(0, self._update_rec_bar)
 
     def _toggle(self):
         state = self._get_state()
@@ -1730,11 +2305,15 @@ class ZenVoxApp:
         # Capture the active window BEFORE overlay steals focus
         self._paste_target_window = _get_active_window_info()
         dev_id = self.engine.get_device_id(self.input_devs)
+        # In push-to-talk, key-release controls the stop, so disable VAD silence
+        # auto-stop. on_vad_stop stays wired for the max-duration safety cap.
+        ptt = self.settings.capture_mode == CAPTURE_PTT
         try:
             self.engine.start_recording(
-                device_id=dev_id,
-                on_vad_stop=lambda: self.root.after(0, self._stop_and_transcribe))
-            self._set_app_state(AppState.RECORDING, "Recording...")
+                device_id=dev_id, vad_autostop=not ptt,
+                on_vad_stop=lambda: self.root.after(0, self._stop_and_transcribe),
+                on_partial=lambda t: self.root.after(0, lambda t=t: self._on_partial_preview(t)))
+            self._set_app_state(AppState.RECORDING, "Recording (hold)..." if ptt else "Recording...")
             self.root.after(0, lambda: self._overlay.show("recording"))
             self.root.after(0, self._update_rec_bar)
         except Exception as e:
@@ -1743,22 +2322,46 @@ class ZenVoxApp:
             self.root.after(0, self._update_rec_bar)
 
     def _stop_and_transcribe(self):
-        audio, duration = self.engine.stop_recording()
-        self.root.after(0, self._update_rec_bar)
-        if audio is None:
-            self._set_app_state(AppState.IDLE, f"Ready [{DEVICE_LABEL}]")
-            self.root.after(0, self._overlay.hide)
-            return
-        self._last_clean_reason = ""
-        self._set_app_state(AppState.TRANSCRIBING, "Transcribing...")
-        self.root.after(0, lambda: self._overlay.show("transcribing"))
-        self.root.after(0, self._update_rec_bar)
+        # Called from the VAD auto-stop (Tk thread) and the hotkey thread. The
+        # stop itself joins the VAD worker (up to 2s); doing that on either of
+        # those threads freezes the UI or risks the listener. Run the whole
+        # stop+transcribe on the single-worker pipeline executor instead.
         try:
-            self._pipeline_executor.submit(self._transcribe, audio, duration)
+            self._pipeline_executor.submit(self._stop_and_transcribe_task)
         except RuntimeError:
             log.exception("Pipeline executor is unavailable")
+            self.engine.force_reset()  # release stream + VAD worker even when gone
             self._set_app_state(AppState.IDLE, "Pipeline unavailable - try again")
             self.root.after(0, self._overlay.hide)
+
+    def _stop_and_transcribe_task(self):
+        # _stopping marks the window where engine._recording is already False but
+        # the app state is still RECORDING (stop_recording joins the VAD worker
+        # and closes the stream, up to ~2s). Without it, the watchdog would see
+        # "RECORDING but engine idle" and wrongly flash IDLE / hide the overlay.
+        self._stopping = True
+        try:
+            try:
+                audio, duration = self.engine.stop_recording()
+            except Exception:
+                log.exception("stop_recording failed — recovering to IDLE")
+                self.engine.force_reset()
+                self._set_app_state(AppState.IDLE, f"Ready [{self.engine.active_device_label}] - recovered")
+                self.root.after(0, self._overlay.hide)
+                self.root.after(0, self._update_rec_bar)
+                return
+            self.root.after(0, self._update_rec_bar)
+            if audio is None:
+                self._set_app_state(AppState.IDLE, f"Ready [{self.engine.active_device_label}]")
+                self.root.after(0, self._overlay.hide)
+                return
+            self._last_clean_reason = ""
+            self._set_app_state(AppState.TRANSCRIBING, "Transcribing...")
+            self.root.after(0, lambda: self._overlay.show("transcribing"))
+            self.root.after(0, self._update_rec_bar)
+            self._transcribe(audio, duration)
+        finally:
+            self._stopping = False
 
     def _transcribe(self, audio, duration):
         try:
@@ -1799,9 +2402,9 @@ class ZenVoxApp:
             self.last_text = f"[Error: {e}]"
             self.root.after(0, lambda: self._gui_update_text(self.last_text))
         finally:
-            ready_msg = f"Ready [{DEVICE_LABEL}]"
+            ready_msg = f"Ready [{self.engine.active_device_label}]"
             if self._last_clean_reason:
-                ready_msg = f"Ready [{DEVICE_LABEL}] - raw text kept ({self._last_clean_reason})"
+                ready_msg = f"Ready [{self.engine.active_device_label}] - raw text kept ({self._last_clean_reason})"
             self._set_app_state(AppState.IDLE, ready_msg)
             self.root.after(0, self._overlay.hide)
             self.root.after(0, self._update_rec_bar)
