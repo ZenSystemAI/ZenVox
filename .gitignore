@@ -16,3 +16,12 @@ build/
 *.egg-info/
 .claude/
 .playwright-mcp/
+
+# Remote ASR server — secrets, logs, and downloaded model weights (never commit)
+asr-server/.token
+asr-server/asr.env
+asr-server/*.env
+asr-server/server.log
+asr-server/whisper-cpp/models/
+*.bin
+*.gguf

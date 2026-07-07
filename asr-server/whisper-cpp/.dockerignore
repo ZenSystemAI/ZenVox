@@ -1,0 +1,6 @@
+.git
+.hermes
+models
+build
+*.bin
+*.log

@@ -1,6 +1,6 @@
 """
 providers.py — Multi-provider LLM cleaning backends
-Supports: Gemini, OpenAI, Anthropic, Groq, Ollama
+Supports: Local, Gemini, OpenAI, Anthropic, Groq, Ollama
 """
 import inspect
 import json
@@ -11,13 +11,50 @@ from urllib import request as urllib_request
 log = logging.getLogger("zenvox")
 DEFAULT_REQUEST_TIMEOUT = 15.0
 
+# ── Language-preservation guard ──────────────────────────────────────────────
+# Small local cleaning models sometimes TRANSLATE the dictation instead of
+# cleaning it (observed live: "C'est un meilleur travail…" → "It's the best
+# work…") despite every preset forbidding translation. Cheap stopword-ratio
+# check: if the raw text is clearly majority-French and the cleaned text is
+# clearly majority-English (or vice versa), the cleaner rewrote the language —
+# fall back to raw. Mixed franglais stays untouched (ratios land mid-range).
+_FR_STOPWORDS = frozenset(
+    "le la les un une des de du et est que qui pour dans sur avec pas ne je tu "
+    "il elle on nous vous ils ce ca ça c'est mais ou où si au aux mon ma mes ton "
+    "ta tes son sa ses faire fait être avoir plus tout bien besoin voir comme "
+    "alors donc quand même aussi très ont sont était j'ai n'est d'un d'une".split())
+_EN_STOPWORDS = frozenset(
+    "the a an of and is are that which for in on with not no i you he she we "
+    "they it this but or if to at my your his her its do does done be have has "
+    "more all well need see like so then was were what by when even also very "
+    "had been it's don't isn't i'm".split())
+
+
+def _fr_ratio(text):
+    words = [w.strip(".,!?;:'\"()«»").lower() for w in text.split()]
+    fr = sum(1 for w in words if w in _FR_STOPWORDS)
+    en = sum(1 for w in words if w in _EN_STOPWORDS)
+    total = fr + en
+    if total < 3:
+        return None  # not enough signal to judge
+    return fr / total
+
+
+def translation_detected(raw_text, cleaned_text):
+    """True when the cleaned text flipped language wholesale vs the raw text."""
+    rs, cs = _fr_ratio(raw_text), _fr_ratio(cleaned_text)
+    if rs is None or cs is None:
+        return False
+    return (rs >= 0.7 and cs <= 0.3) or (rs <= 0.3 and cs >= 0.7)
+
 # Provider name → (default model, label)
 PROVIDERS = {
-    "Gemini":    {"default_model": "gemini-3.1-flash-lite-preview", "needs_key": True},
+    "Gemini":    {"default_model": "gemini-3.1-flash-lite", "needs_key": True},
     "OpenAI":    {"default_model": "gpt-4o-mini", "needs_key": True},
     "Anthropic": {"default_model": "claude-haiku-4-5-20251001", "needs_key": True},
     "Groq":      {"default_model": "llama-3.3-70b-versatile", "needs_key": True},
     "Ollama":    {"default_model": "llama3.2:3b", "needs_key": False},
+    "Local":     {"default_model": "qwen3.6-moe", "needs_key": False},
 }
 
 PROVIDER_NAMES = list(PROVIDERS.keys())
@@ -76,7 +113,7 @@ class GeminiProvider(CleaningProvider):
                 "temperature": 0.2,
                 "max_output_tokens": max_tokens,
             })
-        return r.text.strip()
+        return (r.text or "").strip()
 
 
 class OpenAIProvider(CleaningProvider):
@@ -100,7 +137,7 @@ class OpenAIProvider(CleaningProvider):
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": f"[RAW] {raw_text} [/RAW]"},
             ])
-        return r.choices[0].message.content.strip()
+        return (r.choices[0].message.content or "").strip()
 
 
 class AnthropicProvider(CleaningProvider):
@@ -125,7 +162,7 @@ class AnthropicProvider(CleaningProvider):
             messages=[
                 {"role": "user", "content": f"[RAW] {raw_text} [/RAW]"},
             ])
-        return r.content[0].text.strip()
+        return (r.content[0].text or "").strip()
 
 
 class GroqProvider(CleaningProvider):
@@ -149,7 +186,7 @@ class GroqProvider(CleaningProvider):
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": f"[RAW] {raw_text} [/RAW]"},
             ])
-        return r.choices[0].message.content.strip()
+        return (r.choices[0].message.content or "").strip()
 
 
 class OllamaProvider(CleaningProvider):
@@ -185,13 +222,13 @@ class OllamaProvider(CleaningProvider):
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"Unexpected Ollama response: {body!r}") from exc
 
-
 _PROVIDER_MAP = {
     "Gemini": GeminiProvider,
     "OpenAI": OpenAIProvider,
     "Anthropic": AnthropicProvider,
     "Groq": GroqProvider,
     "Ollama": OllamaProvider,
+    "Local": OllamaProvider,
 }
 
 
@@ -201,6 +238,6 @@ def create_provider(provider_name, api_key, model_name, system_prompt,
     cls = _PROVIDER_MAP.get(provider_name)
     if cls is None:
         raise ValueError(f"Unknown provider: {provider_name}")
-    if provider_name == "Ollama" and endpoint:
+    if provider_name in ("Ollama", "Local") and endpoint:
         return cls(api_key, model_name, system_prompt, endpoint=endpoint, timeout=timeout)
     return cls(api_key, model_name, system_prompt, timeout=timeout)

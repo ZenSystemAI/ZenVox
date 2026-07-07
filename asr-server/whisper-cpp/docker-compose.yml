@@ -1,0 +1,31 @@
+services:
+  zenvox-asr:
+    build: .
+    image: zenvox-whisper-cpp
+    container_name: zenvox-asr
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    ports:
+      # Bind a specific address — "8772:8772" published on 0.0.0.0 and Docker's
+      # iptables rules bypass ufw, so the unauthenticated whisper-server would be
+      # reachable from the whole LAN. Set ZENVOX_ASR_BIND to a private address
+      # (e.g. your VPN/tailnet IP) so only trusted peers can reach it.
+      - "${ZENVOX_ASR_BIND:-127.0.0.1}:8772:8772"
+    volumes:
+      - ./models:/app/models:ro
+    command: >
+      --model /app/models/ggml-large-v3-turbo.bin
+      --host 0.0.0.0
+      --port 8772
+      --inference-path /v1/audio/transcriptions
+      --language auto
+      --flash-attn
+      --no-timestamps
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -7,9 +7,11 @@ import math
 import os
 import struct
 import sys
-from dataclasses import dataclass, asdict
+import threading
+from dataclasses import dataclass, asdict, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from providers import PROVIDERS
 
 import sounddevice as sd
 from PIL import Image, ImageDraw
@@ -44,9 +46,10 @@ NUM_WORKERS = min(os.cpu_count() // 4 or 1, 4)
 # real utterance is never silently dropped. Pure silence stays below it.
 NO_SPEECH_PEAK_FLOOR = 0.01
 # Hard cap on a single recording. A stuck VAD must never produce an unbounded
-# clip; auto-stop here. Also keeps audio arrays well clear of the float32
-# index-precision danger zone during resampling.
-MAX_RECORD_SECONDS = 300
+# clip; auto-stop here. 20 min (Wispr Flow parity) ≈ 76 MB of float32 at 16 kHz
+# — still well clear of the float32 index-precision danger zone now that
+# resampling uses float64 indices.
+MAX_RECORD_SECONDS = 1200
 # Watchdog: if the app sits in TRANSCRIBING/CLEANING longer than this, something
 # wedged (hung network call, dead worker) — force a reset back to IDLE so the
 # hotkey keeps working instead of appearing "stuck on".
@@ -80,10 +83,15 @@ CLEANING_PRESETS = {
         "RULE 3: The speaker is bilingual (English + French Canadian) and often mixes both languages. Preserve the exact language mix \u2014 do NOT translate. "
         "RULE 4: Remove ALL filler words (um, uh, like, you know, so, basically, literally, euh, ben, genre, ts\u00e9, l\u00e0, pis, anyway, etc.), remove repeated words and phrases, fix punctuation, capitalize sentences properly. "
         "RULE 5: Do NOT add new ideas, do NOT change meaning, do NOT restructure sentences beyond cleanup. "
+        "RULE 6: BACKTRACKING \u2014 when the speaker corrects themselves mid-sentence (\"send it Monday, no wait, Tuesday\", "
+        "\"call Bob, I mean Rob\"), keep ONLY the corrected version and drop the retracted words and the correction cue. "
         "OUTPUT: Return ONLY the corrected text \u2014 no explanation, no quotes, no preamble, no [RAW] tags.\n\n"
         "Example:\n"
         "Input: [RAW] um so what is the best way to like uh deploy this thing [/RAW]\n"
         "Output: What is the best way to deploy this thing?\n\n"
+        "Example:\n"
+        "Input: [RAW] let's meet monday no wait tuesday at 3 [/RAW]\n"
+        "Output: Let's meet Tuesday at 3.\n\n"
         "Example:\n"
         "Input: [RAW] euh j'ai besoin de like checker le the workflow pour voir si \u00e7a marche [/RAW]\n"
         "Output: J'ai besoin de checker le workflow pour voir si \u00e7a marche."
@@ -97,6 +105,8 @@ CLEANING_PRESETS = {
         "RULE 4: Remove filler words (um, uh, like, you know, euh, ben, genre, ts\u00e9, l\u00e0, pis), remove repeated words, fix punctuation. "
         "RULE 5: When the speaker says 'dot', 'slash', 'dash', 'underscore', 'equals', 'colon', 'open paren', 'close paren' in the context of code/commands, convert them to actual symbols (., /, -, _, =, :, (, )). "
         "RULE 6: Do NOT add ideas, do NOT change meaning, do NOT restructure beyond cleanup. "
+        "RULE 7: BACKTRACKING \u2014 when the speaker corrects themselves mid-sentence, keep ONLY the corrected version "
+        "and drop the retracted words (e.g. \"import numpy, no, import pandas\" -> \"import pandas\"). "
         "OUTPUT: Return ONLY the corrected text \u2014 no explanation, no quotes, no preamble."
     ),
     "Minimal": (
@@ -126,6 +136,7 @@ CLEANING_PRESETS = {
         "RULE 2: Remove filler words and repetitions, fix punctuation and capitalization, and break into clean paragraphs. "
         "RULE 3: Polish the tone to be clear and professional, but keep the speaker's wording and meaning \u2014 do NOT invent content, and do NOT add a greeting or sign-off that was not dictated. "
         "RULE 4: The speaker is bilingual (English + French Canadian). Preserve the exact language mix \u2014 do NOT translate. "
+        "RULE 5: BACKTRACKING \u2014 when the speaker corrects themselves mid-sentence, keep ONLY the corrected version and drop the retracted words. "
         "OUTPUT: Return ONLY the email body text \u2014 no explanation, no quotes, no preamble, no subject line unless dictated."
     ),
 }
@@ -234,13 +245,10 @@ def _dot_icon(color):
     ImageDraw.Draw(img).ellipse([4, 4, 60, 60], fill=color)
     return img
 
-ICONS = {
-    "idle":         _dot_icon("#41BFA8"),   # green — ready
-    "recording":    _dot_icon("#EF5350"),   # red — recording
-    "transcribing": _dot_icon("#FF9800"),   # orange — transcribing
-    "loading":      _dot_icon("#9E9E9E"),   # grey — loading
-    "error":        _dot_icon("#B71C1C"),   # red — error
-}
+# Tray dot colors come from the shared theme so the idle dot matches the brand
+# teal (was #41BFA8 — a near-miss that drifted from the app accent).
+from theme import TRAY as _TRAY
+ICONS = {state: _dot_icon(color) for state, color in _TRAY.items()}
 
 # ── Audio feedback (in-memory WAV) ───────────────────────────────────────────
 def _wav(freq, duration_ms, volume=0.3):
@@ -283,6 +291,10 @@ def setup_logging():
         return logger
     logger.setLevel(logging.DEBUG)
     fh = RotatingFileHandler(str(LOG_FILE), maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    try:
+        os.chmod(LOG_FILE, 0o600)  # DEBUG level may carry transcript content
+    except OSError:
+        pass
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
     logger.addHandler(fh)
@@ -390,11 +402,18 @@ API_KEY_FIELDS = (
 
 @dataclass
 class Settings:
+    # save() is called from the Tk thread AND the tray thread; unsynchronized
+    # writers shared the same .tmp path and could tear the JSON.
+    _save_lock = threading.Lock()
+    # provider -> value last written to keyring this session (skip unchanged —
+    # each write is a synchronous SecretService D-Bus round-trip).
+    _keyring_cache = {}
+
     model_name: str = "large-v3-turbo"
     lang_name: str = "Auto-detect"
     mic_name: str = ""
-    clean_provider: str = "Gemini"
-    clean_model: str = "gemini-3.1-flash-lite-preview"
+    clean_provider: str = "Local"
+    clean_model: str = "qwen3.6-moe"
     # Per-provider API keys (so users can switch without re-entering)
     gemini_api_key: str = ""
     openai_api_key: str = ""
@@ -402,10 +421,15 @@ class Settings:
     groq_api_key: str = ""
     hotkey_record: str = "f6"
     hotkey_repaste: str = "Ctrl+Alt+F11"
-    silence_timeout: float = 2.5
+    # 1.2s: the wait after you stop talking is the single largest fixed latency
+    # in toggle mode — 2.5s made every dictation feel slow. vad_neg_thresh
+    # hysteresis still guards against mid-sentence pauses; raise it back in
+    # Settings if you dictate with long deliberate pauses.
+    silence_timeout: float = 1.2
     vad_threshold: float = 0.5
     vad_neg_thresh: float = 0.35
     ollama_endpoint: str = "http://localhost:11434/v1"
+    local_endpoint: str = "http://localhost:8001/v1"
     output_mode: str = "Auto-paste"
     cleaning_preset: str = "General"
     output_file: str = ""
@@ -413,8 +437,29 @@ class Settings:
     capture_mode: str = "toggle"   # "toggle" or "ptt" (push-to-talk)
     transcription_backend: str = "local"   # "local" or "remote"
     remote_url: str = "http://127.0.0.1:8771/v1"   # OpenAI-compatible ASR; set your server host in Settings
+    remote_token: str = ""   # optional shared secret (ZENVOX_ASR_TOKEN on the server)
     live_preview: bool = False   # show partial text while still speaking (best with GPU/remote)
     preview_interval: float = 1.5   # seconds between live-preview transcriptions
+    quiet_mode: bool = False   # whisper/quiet speech: lower VAD thresholds + accept faint audio
+    # Per-app cleaning-preset rules (Wispr-style "Slack sounds casual, Gmail
+    # sounds professional"). Each: {"pattern": "*slack*|*discord*", "preset": "General"}.
+    # First rule whose glob(s) match the focused window's class/title wins;
+    # falls back to cleaning_preset. X11 only (Wayland has no active-window API).
+    app_rules: list = field(default_factory=list)
+
+    def preset_for_window(self, window_class="", window_name=""):
+        """Return the cleaning preset for the given focused window, honoring
+        app_rules; falls back to the global cleaning_preset."""
+        import fnmatch
+        hay = f"{window_class} {window_name}".lower()
+        for rule in self.app_rules:
+            pattern = str(rule.get("pattern", "")).lower()
+            preset = rule.get("preset")
+            if not pattern or preset not in PRESET_NAMES:
+                continue
+            if any(fnmatch.fnmatch(hay, p.strip()) for p in pattern.split("|") if p.strip()):
+                return preset
+        return self.cleaning_preset
 
     def get_api_key(self):
         """Return the API key for the currently selected provider."""
@@ -451,7 +496,18 @@ class Settings:
                     except Exception:
                         data[attr] = ""
             settings = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
-        except Exception:
+        except FileNotFoundError:
+            settings = cls()
+        except Exception as e:
+            # A corrupt settings.json used to silently reset every setting AND
+            # get overwritten on the next save. Keep the evidence and say so.
+            logging.getLogger("zenvox").error(
+                f"settings.json unreadable ({e}) — resetting to defaults, "
+                f"corrupt file kept as settings.json.bad")
+            try:
+                os.replace(str(SETTINGS_FILE), str(SETTINGS_FILE) + ".bad")
+            except OSError:
+                pass
             settings = cls()
         # Try to load API keys from keyring (overrides file values)
         try:
@@ -460,36 +516,57 @@ class Settings:
                 val = keyring.get_password(KEYRING_SERVICE, provider)
                 if val and not getattr(settings, attr):
                     setattr(settings, attr, val)
+                # Seed the written-value cache so save() only does keyring
+                # D-Bus round-trips for keys that actually changed.
+                cls._keyring_cache[provider] = val or ""
         except Exception:
             pass
+        # Migrate the dead Gemini preview model (shut down 2026-05-25) so
+        # returning users whose settings.json still pins it aren't left on a
+        # broken model. Flip to the stable replacement for Gemini, otherwise to
+        # the chosen provider's default — without changing their provider.
+        if settings.clean_model == "gemini-3.1-flash-lite-preview":
+            if settings.clean_provider == "Gemini":
+                settings.clean_model = "gemini-3.1-flash-lite"
+            else:
+                settings.clean_model = PROVIDERS.get(
+                    settings.clean_provider, {}).get("default_model", "qwen3.6-moe")
         return settings
 
     def save(self):
-        data = asdict(self)
-        # Priority: keyring → DPAPI-encrypted → plaintext (last resort with warning)
-        try:
-            import keyring
-            for provider, attr in API_KEY_FIELDS:
-                val = data.get(attr, "")
-                if val:
-                    keyring.set_password(KEYRING_SERVICE, provider, val)
-                else:
-                    try:
-                        keyring.delete_password(KEYRING_SERVICE, provider)
-                    except Exception:
-                        keyring.set_password(KEYRING_SERVICE, provider, "")
-                data[attr] = ""  # Keep disk state consistent with keyring
-        except Exception:
-            # Keyring unavailable — fall back to DPAPI encryption
+        with Settings._save_lock:
+            data = asdict(self)
+            # Priority: keyring → DPAPI-encrypted → plaintext (last resort)
             try:
-                for _, attr in API_KEY_FIELDS:
+                import keyring
+                for provider, attr in API_KEY_FIELDS:
                     val = data.get(attr, "")
-                    if val and not val.startswith("dpapi:"):
-                        data[attr] = _dpapi_encrypt(val)
+                    if Settings._keyring_cache.get(provider) != val:
+                        if val:
+                            keyring.set_password(KEYRING_SERVICE, provider, val)
+                        else:
+                            try:
+                                keyring.delete_password(KEYRING_SERVICE, provider)
+                            except Exception:
+                                pass
+                        Settings._keyring_cache[provider] = val
+                    data[attr] = ""  # Keep disk state consistent with keyring
             except Exception:
-                import logging as _logging
-                _logging.getLogger("zenvox").warning(
-                    "keyring and DPAPI both unavailable — API keys stored in plaintext settings.json")
-        tmp = SETTINGS_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.replace(str(tmp), str(SETTINGS_FILE))
+                # Keyring unavailable — fall back to DPAPI encryption (Windows)
+                try:
+                    for _, attr in API_KEY_FIELDS:
+                        val = data.get(attr, "")
+                        if val and not val.startswith("dpapi:"):
+                            data[attr] = _dpapi_encrypt(val)
+                except Exception:
+                    import logging as _logging
+                    _logging.getLogger("zenvox").warning(
+                        "keyring and DPAPI both unavailable — API keys stored in "
+                        "plaintext settings.json (file locked to mode 600)")
+            tmp = SETTINGS_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            try:
+                os.chmod(tmp, 0o600)  # keys may be inside — never world-readable
+            except OSError:
+                pass
+            os.replace(str(tmp), str(SETTINGS_FILE))

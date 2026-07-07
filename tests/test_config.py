@@ -93,5 +93,41 @@ class SettingsPersistenceTests(unittest.TestCase):
             self.assertEqual(loaded.openai_api_key, "")
 
 
+class DeadModelMigrationTests(SettingsPersistenceTests):
+    def _write_settings(self, tmpdir, payload):
+        settings_path = Path(tmpdir) / "settings.json"
+        settings_path.write_text(json.dumps(payload), encoding="utf-8")
+        self.config.SETTINGS_FILE = settings_path
+
+    def test_gemini_preview_migrated_to_stable_gemini(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_settings(tmpdir, {
+                "clean_provider": "Gemini",
+                "clean_model": "gemini-3.1-flash-lite-preview",
+            })
+            loaded = self.config.Settings.load()
+            self.assertEqual(loaded.clean_provider, "Gemini")
+            self.assertEqual(loaded.clean_model, "gemini-3.1-flash-lite")
+
+    def test_preview_model_on_other_provider_migrated_to_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_settings(tmpdir, {
+                "clean_provider": "OpenAI",
+                "clean_model": "gemini-3.1-flash-lite-preview",
+            })
+            loaded = self.config.Settings.load()
+            self.assertEqual(loaded.clean_provider, "OpenAI")
+            self.assertEqual(loaded.clean_model, "gpt-4o-mini")
+
+    def test_non_preview_model_is_left_untouched(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_settings(tmpdir, {
+                "clean_provider": "Local",
+                "clean_model": "qwen3.6-moe",
+            })
+            loaded = self.config.Settings.load()
+            self.assertEqual(loaded.clean_model, "qwen3.6-moe")
+
+
 if __name__ == "__main__":
     unittest.main()

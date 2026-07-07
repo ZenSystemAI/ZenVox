@@ -47,7 +47,7 @@ gpu = [
 zenvox = "zenvox:main"
 
 [tool.setuptools]
-py-modules = ["zenvox", "config", "providers", "history"]
+py-modules = ["zenvox", "config", "providers", "history", "dictionary", "theme"]
 
 [build-system]
 requires = ["setuptools>=68.0"]

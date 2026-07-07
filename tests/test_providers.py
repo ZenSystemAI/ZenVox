@@ -4,7 +4,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from providers import OllamaProvider, OpenAIProvider
+from providers import OllamaProvider, OpenAIProvider, create_provider
 
 
 class FakeResponse:
@@ -53,6 +53,34 @@ class OllamaProviderTests(unittest.TestCase):
             seen["body"]["messages"][1]["content"],
             "[RAW] raw text [/RAW]",
         )
+
+
+class LocalProviderFactoryTests(unittest.TestCase):
+    def test_local_provider_is_ollama_hitting_local_endpoint(self):
+        """The Local cleaning provider reuses the OpenAI-compatible HTTP
+        client and must POST to {local_endpoint}/chat/completions."""
+        seen = {}
+
+        def fake_urlopen(request, timeout):
+            seen["url"] = request.full_url
+            seen["timeout"] = timeout
+            seen["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse({
+                "choices": [{"message": {"content": " cleaned text "}}],
+            })
+
+        provider = create_provider(
+            "Local", "", "qwen3.6-moe", "Clean the transcription.",
+            endpoint="http://h:8001/v1", timeout=30.0)
+
+        self.assertIsInstance(provider, OllamaProvider)
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = provider.clean("raw text", max_tokens=64)
+
+        self.assertEqual(result, "cleaned text")
+        self.assertEqual(seen["url"], "http://h:8001/v1/chat/completions")
+        self.assertEqual(seen["timeout"], 30.0)
+        self.assertEqual(seen["body"]["model"], "qwen3.6-moe")
 
 
 class OpenAIProviderTests(unittest.TestCase):

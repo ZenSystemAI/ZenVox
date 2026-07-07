@@ -34,23 +34,39 @@ MIN_SPOKEN_LEN = 2
 MAX_HOTWORDS = 96
 
 
+# Entry kinds:
+#   "term"    — vocabulary word: bias + replace + prompt-lock (the default).
+#   "snippet" — voice-triggered text expansion: spoken trigger -> `written`
+#               expansion, applied deterministically AFTER cleaning so the LLM
+#               never rewrites the expanded body.
+KIND_TERM = "term"
+KIND_SNIPPET = "snippet"
+
+
 @dataclass
 class DictionaryEntry:
-    written: str                                  # canonical spelling, e.g. "ZenVox"
-    spoken: list = field(default_factory=list)    # variants to replace, e.g. ["zen vox"]
+    written: str                                  # canonical spelling / expansion body
+    spoken: list = field(default_factory=list)    # variants to replace / snippet triggers
     boost_only: bool = False                      # bias + prompt only, no find/replace
     case_sensitive: bool = False
     enabled: bool = True
+    kind: str = KIND_TERM
 
     @classmethod
     def from_dict(cls, d):
+        kind = str(d.get("kind", KIND_TERM)).strip() or KIND_TERM
         return cls(
             written=str(d.get("written", "")).strip(),
             spoken=[str(s).strip() for s in d.get("spoken", []) if str(s).strip()],
             boost_only=bool(d.get("boost_only", False)),
             case_sensitive=bool(d.get("case_sensitive", False)),
             enabled=bool(d.get("enabled", True)),
+            kind=kind if kind in (KIND_TERM, KIND_SNIPPET) else KIND_TERM,
         )
+
+    @property
+    def is_snippet(self):
+        return self.kind == KIND_SNIPPET
 
 
 class Dictionary:
@@ -105,12 +121,42 @@ class Dictionary:
             self.entries = []
         self.save()
 
+    def invalidate_cache(self):
+        """Drop the compiled Layer-B cache after an in-place entry mutation
+        (enable toggle, edit) that didn't go through add()/save()."""
+        with self._lock:
+            self._compiled = None
+
+    def import_json(self, path):
+        """Merge entries from a JSON file (same shape as dictionary.json).
+        Existing entries with the same `written` are replaced. Returns count."""
+        import json as _json
+        data = _json.loads(open(path, encoding="utf-8").read())
+        incoming = [DictionaryEntry.from_dict(d) for d in data.get("entries", [])]
+        incoming = [e for e in incoming if e.written]
+        with self._lock:
+            by_key = {e.written.lower(): e for e in self.entries}
+            for e in incoming:
+                by_key[e.written.lower()] = e
+            self.entries = list(by_key.values())
+            self._compiled = None
+        self.save()
+        return len(incoming)
+
+    def export_json(self, path):
+        import json as _json
+        with self._lock:
+            data = {"version": 1, "entries": [asdict(e) for e in self.entries]}
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(data, f, indent=2, ensure_ascii=False)
+
     def __len__(self):
         return len(self.entries)
 
     # ── Layer A: Whisper bias ─────────────────────────────────────────────
     def hotwords_string(self):
-        terms = [e.written for e in self.entries if e.enabled and e.written]
+        terms = [e.written for e in self.entries
+                 if e.enabled and e.written and not e.is_snippet]
         if not terms:
             return ""
         return ", ".join(terms[:MAX_HOTWORDS])
@@ -121,7 +167,7 @@ class Dictionary:
         # Longest spoken forms first so multi-word variants win over substrings.
         pairs = []
         for e in self.entries:
-            if not e.enabled or e.boost_only or not e.written:
+            if not e.enabled or e.boost_only or not e.written or e.is_snippet:
                 continue
             for sp in e.spoken:
                 # Skip only an exact-string no-op; a case-only difference
@@ -150,7 +196,8 @@ class Dictionary:
 
     # ── Layer C: LLM cleaning prompt injection ────────────────────────────
     def prompt_block(self):
-        terms = [e.written for e in self.entries if e.enabled and e.written]
+        terms = [e.written for e in self.entries
+                 if e.enabled and e.written and not e.is_snippet]
         if not terms:
             return ""
         joined = ", ".join(terms[:MAX_HOTWORDS])
@@ -159,3 +206,30 @@ class Dictionary:
             "Spell them EXACTLY as written and never translate, expand, or "
             f"\"correct\" them: {joined}."
         )
+
+    # ── Layer D: snippet expansion (post-clean, deterministic) ────────────
+    def apply_snippets(self, text):
+        """Expand voice-triggered snippets: a spoken trigger phrase becomes its
+        expansion body. Applied AFTER cleaning so the LLM never rewrites the
+        expansion. Word-boundary, longest-trigger-first."""
+        if not text:
+            return text
+        triggers = []
+        with self._lock:
+            for e in self.entries:
+                if not e.enabled or not e.is_snippet or not e.written:
+                    continue
+                for trig in e.spoken:
+                    if len(trig) >= MIN_SPOKEN_LEN:
+                        triggers.append((trig, e.written, e.case_sensitive))
+        for trig, body, cs in sorted(triggers, key=lambda t: len(t[0]), reverse=True):
+            flags = 0 if cs else re.IGNORECASE
+            try:
+                pat = re.compile(rf"\b{re.escape(trig)}\b", flags)
+                text = pat.sub(lambda m: body, text)
+            except re.error as e:
+                log.warning(f"Snippet trigger skipped for {trig!r}: {e}")
+        return text
+
+    def has_snippets(self):
+        return any(e.enabled and e.is_snippet for e in self.entries)

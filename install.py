@@ -142,14 +142,20 @@ def build_ico():
 def create_shortcut_windows():
     """Create Windows Start Menu shortcut."""
     target = str(VENV_PYTHONW) if VENV_PYTHONW and VENV_PYTHONW.exists() else str(VENV_PYTHON)
+
+    def ps_quote(s):
+        # Single-quoted PowerShell strings only expand '' — no $() injection
+        # from a hostile/unlucky install path.
+        return "'" + str(s).replace("'", "''") + "'"
+
     ps_script = f'''
 $ws  = New-Object -ComObject WScript.Shell
-$lnk = $ws.CreateShortcut("{START_MENU}")
-$lnk.TargetPath       = "{target}"
-$lnk.Arguments        = '"{SCRIPT}"'
-$lnk.WorkingDirectory = "{HERE}"
-$lnk.IconLocation     = "{ICO_OUT},0"
-$lnk.Description      = "ZenVox - Voice to text, cleaned by AI"
+$lnk = $ws.CreateShortcut({ps_quote(START_MENU)})
+$lnk.TargetPath       = {ps_quote(target)}
+$lnk.Arguments        = {ps_quote('"' + str(SCRIPT) + '"')}
+$lnk.WorkingDirectory = {ps_quote(HERE)}
+$lnk.IconLocation     = {ps_quote(str(ICO_OUT) + ',0')}
+$lnk.Description      = 'ZenVox - Voice to text, cleaned by AI'
 $lnk.Save()
 '''
     result = subprocess.run(
@@ -165,11 +171,13 @@ def create_desktop_file_linux():
     """Create .desktop file for Linux application menu."""
     DESKTOP_FILE.parent.mkdir(parents=True, exist_ok=True)
     icon_path = ICON_PNG if ICON_PNG.exists() else ""
+    # Exec values are word-split by the launcher — quote both paths or an
+    # install dir containing spaces silently breaks the menu entry.
     content = f"""[Desktop Entry]
 Type=Application
 Name=ZenVox
 Comment=Voice to text, cleaned by AI
-Exec={VENV_PYTHON} {SCRIPT}
+Exec="{VENV_PYTHON}" "{SCRIPT}"
 Icon={icon_path}
 Terminal=false
 Categories=AudioVideo;Audio;Utility;
