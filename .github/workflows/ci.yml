@@ -1,0 +1,54 @@
+# CI for ZenVox — inline workflow (plan 028 Phase 1.3 wiring).
+#
+# DELIBERATE DEVIATION from the org reusable workflow
+# (ZenSystemAI/.github/.github/workflows/node-ci-reusable.yml@main), for two
+# independently sufficient reasons:
+#   1. ZenVox is a PUBLIC repo and ZenSystemAI/.github is PRIVATE. GitHub does
+#      not allow workflows in public repos to call reusable workflows stored in
+#      private repos, regardless of the Actions access policy on the called
+#      repo (docs: "Sharing actions and workflows from your private
+#      repository" — sharing extends to *other private repositories* only).
+#   2. ZenVox is a Python project (pyproject.toml + setuptools; there is no
+#      package.json) — the node-ci reusable workflow (setup-node / npm ci /
+#      npm script detection) has nothing to run here and would hard-fail at
+#      "npm ci" on every PR forever.
+#
+# The job id is 'verify' so the check run surfaces as bare 'verify', matching
+# the org-wide required-status-check convention (inline jobs surface as the
+# job id; only reusable-workflow calls surface as 'caller / callee').
+#
+# Gates (repo has NO test suite yet — these are the honest gates available):
+#   - byte-compile every Python source under the declared floor (3.10)
+#   - PEP 517 packaging build (sdist + wheel) validating pyproject metadata
+# When a test suite lands, add its step here (do not silently widen or weaken
+# these gates in unrelated PRs).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Floor of requires-python = ">=3.10" (pyproject.toml) — pinning the
+          # floor verifies the declared minimum actually parses and builds.
+          python-version: '3.10'
+
+      - name: Byte-compile all Python sources
+        run: python -m compileall -q .
+
+      - name: Validate packaging (PEP 517 sdist + wheel)
+        run: |
+          python -m pip install --upgrade build
+          python -m build
