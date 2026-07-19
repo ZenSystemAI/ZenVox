@@ -41,7 +41,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           # Floor of requires-python = ">=3.10" (pyproject.toml) — pinning the
           # floor verifies the declared minimum actually parses and builds.
