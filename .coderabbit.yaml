@@ -1,0 +1,30 @@
+# Central CodeRabbit config for ZenSystemAI — applies to every org repo WITHOUT its own
+# .coderabbit.yaml. WARNING: a repo-local .coderabbit.yaml SHADOWS this file entirely
+# (CodeRabbit inheritance is disabled by default) — if you ever add one, copy the
+# ignore_usernames list AND the label gate into it.
+#
+# Staged 2026-07-24 (plan 028 v4 / review-stack routing). Merge to
+# ZenSystemAI/coderabbit only AFTER:
+#   1) Pro+ seat purchased monthly
+#   2) manual seat assignment; auto-provisioning/refill OFF; usage add-on OFF
+#   3) sole seat is zen-agents[bot] (no Skiipy11 seat)
+# Do NOT ignore zen-agents[bot] — App-authored PRs must be reviewable.
+reviews:
+  auto_review:
+    enabled: false
+    labels:
+      - "review:standard"
+      - "review:deep"
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 0
+    drafts: false
+    ignore_usernames:
+      - "dependabot[bot]"
+      - "renovate[bot]"
+      - "github-actions[bot]"
+  path_filters:
+    - "!**/package-lock.json"
+    - "!**/pnpm-lock.yaml"
+    - "!**/dist/**"
+    - "!**/.next/**"
+    - "!**/node_modules/**"
